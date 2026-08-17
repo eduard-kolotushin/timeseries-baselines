@@ -6,12 +6,7 @@ This is **not** a Grafana plugin. Grafana overlays live in [`timeseries-grafana`
 
 See [docs/INTENTIONS.md](docs/INTENTIONS.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Local siblings
-
-```
-replace github.com/eduard-kolotushin/timeseries => ../timeseries
-replace github.com/eduard-kolotushin/timeseries-forecast => ../timeseries-forecast
-```
+Depends on tagged `timeseries` and `timeseries-forecast` modules.
 
 ## Build
 

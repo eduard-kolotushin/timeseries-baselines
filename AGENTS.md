@@ -9,7 +9,7 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - **Module:** `github.com/eduard-kolotushin/timeseries-baselines`
 - **Package:** `baselines`
 - **Go:** 1.26+
-- **Local siblings:** `../timeseries`, `../timeseries-forecast` via `go.mod` replace
+- **Libraries:** tagged `timeseries` and `timeseries-forecast` modules (no `replace`)
 - **Sandbox:** sibling `timeseries-grafana-sandbox` runs this as Compose `baseline-worker`
 
 ## Read first
@@ -36,5 +36,7 @@ Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics
 ## Workflow
 
 - Table-driven tests next to the code under test
+- Depend on tagged `timeseries` and `timeseries-forecast` modules; do not add a `replace` directive
 - `make linux` writes `bin/baselines` for the sandbox container
 - Do not copy Series internals; use the public timeseries API only
+- GitHub Actions on `main`: `gofmt` and `go test ./...`

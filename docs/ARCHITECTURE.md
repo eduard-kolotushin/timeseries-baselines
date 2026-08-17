@@ -52,9 +52,6 @@ Same as `timeseries-forecast`: last timestamp + `k * step` for `k = 1..h`. This 
 - Pre-size times/values slices to the Druid row count
 - Do not keep the training series after fit
 
-## Local modules
+## Modules
 
-```
-replace github.com/eduard-kolotushin/timeseries => ../timeseries
-replace github.com/eduard-kolotushin/timeseries-forecast => ../timeseries-forecast
-```
+`go.mod` requires tagged `github.com/eduard-kolotushin/timeseries` and `github.com/eduard-kolotushin/timeseries-forecast`. Do not add a `replace` directive.

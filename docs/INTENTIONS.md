@@ -14,7 +14,7 @@ Implement the loop efficiently: one O(n) fit per ready hash per tick, O(1) work 
 | Module | `github.com/eduard-kolotushin/timeseries-baselines` |
 | Package | `baselines` |
 | Go | 1.26+ |
-| Input series | public `timeseries.Series[float64]` |
+| Input series | public `timeseries.Series[float64]` from tagged modules (no `replace`) |
 | Model | `FitSeasonalBaseline` minute-of-week |
 | Source | Druid SQL (not the metrics Kafka topic) |
 | Output | one Kafka message per ready metric per tick, at last timestamp + N minutes |
@@ -44,3 +44,4 @@ Do not add these without first updating this document:
 - Do not mutate caller series (libraries already return new series)
 - Table-driven tests for config, Druid SQL client, and publisher ticks
 - One O(n) fit per hash per tick; O(1) per horizon step; pre-size series slices
+- GitHub Actions on `main` runs `gofmt` and `go test ./...`
