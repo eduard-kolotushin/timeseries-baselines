@@ -1,0 +1,22 @@
+---
+description: Optimize baseline publisher computation
+alwaysApply: true
+---
+
+# Performance
+
+This worker must be fast as well as correct. Follow [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Do
+
+- Fit in one **O(n)** pass (`FitSeasonalBaseline` minute-of-week)
+- Pre-size times/values to the Druid series length
+- Fill `Forecast(N)` in one O(N) loop; publish only the last point
+- Add or update tests when changing the tick hot path
+
+## Do not
+
+- Nested O(n²) scans over observations
+- Re-fit on every horizon step
+- Clone the training series unless a helper needs an independent copy
+- Add SIMD, GPU, or a parallel API without updating INTENTIONS

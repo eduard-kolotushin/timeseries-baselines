@@ -1,0 +1,29 @@
+---
+description: Respect baselines worker intentions; keep models in timeseries-forecast
+alwaysApply: true
+---
+
+# Project intentions
+
+Read [docs/INTENTIONS.md](docs/INTENTIONS.md) before expanding scope.
+
+## Stay in v1
+
+Allowed: Druid SQL scan, minute-of-week `FitSeasonalBaseline`, one Kafka message at last+N minutes, env/flag config.
+
+Do **not** add without updating INTENTIONS first:
+
+- Hosting this ticker inside the Grafana plugin
+- Folding Druid/Kafka I/O into `timeseries-forecast`
+- Prometheus
+- Prediction intervals
+- A forked Series type
+- Consuming the metrics Kafka topic
+
+## Optimize computation as you implement
+
+Correctness first, then cost: one O(n) fit per hash per tick, O(1) per horizon step. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Use the sibling libraries
+
+Input is `timeseries.Series[float64]`. Use the public API only. Local development uses `replace => ../timeseries` and `replace => ../timeseries-forecast`.

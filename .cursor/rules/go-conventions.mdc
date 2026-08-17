@@ -1,0 +1,26 @@
+---
+description: Go conventions for the baselines worker
+alwaysApply: true
+---
+
+# Go conventions
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Package
+
+- Single root package `baselines`
+- Module: `github.com/eduard-kolotushin/timeseries-baselines`
+- Go 1.26+
+
+## API
+
+- Config from env/flags; `Validate` before run
+- `Publisher.Run` blocks until context cancel
+- Do not mutate caller series
+
+## Quality
+
+- Table-driven tests next to code
+- No drive-by refactors
+- Fit and forecast stay linear-time (see performance.mdc)
