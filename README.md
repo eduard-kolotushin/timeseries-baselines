@@ -2,7 +2,7 @@
 
 Standalone worker that reads a Druid metrics table, fits a minute-of-week seasonal baseline from [`timeseries-forecast`](https://github.com/eduard-kolotushin/timeseries-forecast), and publishes one lead point per ready `metric_hash` to Kafka.
 
-This is **not** a Grafana plugin. Grafana overlays live in [`timeseries-grafana`](../timeseries-grafana). Local Compose lives in [`timeseries-grafana-sandbox`](../timeseries-grafana-sandbox).
+This is **not** a Grafana plugin. Grafana overlays live in [`timeseries-grafana`](../timeseries-grafana). Local Compose lives in [`timeseries-grafana-sandbox`](../timeseries-grafana-sandbox). The cluster worker image and Helm chart live in [`timeseries-k8s`](../timeseries-k8s).
 
 See [docs/INTENTIONS.md](docs/INTENTIONS.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

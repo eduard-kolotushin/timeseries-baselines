@@ -20,6 +20,7 @@ Implement the loop efficiently: one O(n) fit per ready hash per tick, O(1) work 
 | Output | one Kafka message per ready metric per tick, at last timestamp + N minutes |
 | Config | environment variables (and flags), not Grafana jsonData |
 | Sandbox | sibling `timeseries-grafana-sandbox` |
+| Kubernetes | sibling `timeseries-k8s` (worker image + Helm; no Dockerfile in this repo) |
 
 ## v1 must-have
 
@@ -33,6 +34,7 @@ Implement the loop efficiently: one O(n) fit per ready hash per tick, O(1) work 
 Do not add these without first updating this document:
 
 - Overlay visualization or Grafana plugin hosting
+- Helm / container images (those live in `timeseries-k8s`)
 - Folding this ticker into `timeseries-forecast`
 - Consuming the metrics Kafka topic (Druid is the source of truth)
 - Prometheus

@@ -14,6 +14,7 @@ Allowed: Druid SQL scan, minute-of-week `FitSeasonalBaseline`, one Kafka message
 Do **not** add without updating INTENTIONS first:
 
 - Hosting this ticker inside the Grafana plugin
+- Helm / container images (sibling `timeseries-k8s`)
 - Folding Druid/Kafka I/O into `timeseries-forecast`
 - Prometheus
 - Prediction intervals

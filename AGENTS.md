@@ -11,6 +11,7 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - **Go:** 1.26+
 - **Libraries:** tagged `timeseries` and `timeseries-forecast` modules (no `replace`)
 - **Sandbox:** sibling `timeseries-grafana-sandbox` runs this as Compose `baseline-worker`
+- **Kubernetes:** sibling `timeseries-k8s` builds the worker image from a git pin of this repo
 
 ## Read first
 
@@ -31,7 +32,7 @@ Env-configured ticker, skip short/non-1-minute hashes, one Kafka message at last
 
 ## v1 out of scope
 
-Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka.
+Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka, Docker/Helm packaging (see `timeseries-k8s`).
 
 ## Workflow
 
