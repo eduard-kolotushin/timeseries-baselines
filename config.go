@@ -31,19 +31,28 @@ type Config struct {
 	AheadMinutes    int
 	Interval        time.Duration
 	Calendar        string
+
+	// Sharding. Empty ShardPeers and ShardDNS mean one worker owns every hash.
+	// ShardID defaults to the first non-loopback IP (ShardID in shard.go).
+	ShardID    string
+	ShardPeers []string
+	ShardDNS   string
 }
 
-// ConfigFromEnv reads DRUID_*, KAFKA_*, LOOKBACK, AHEAD_MINUTES, INTERVAL, CALENDAR.
+// ConfigFromEnv reads DRUID_*, KAFKA_*, LOOKBACK, AHEAD_MINUTES, INTERVAL, CALENDAR, SHARD_*.
 func ConfigFromEnv() (Config, error) {
 	cfg := Config{
 		DruidBroker:     strings.TrimSpace(os.Getenv("DRUID_BROKER")),
 		DruidDatasource: strings.TrimSpace(os.Getenv("DRUID_DATASOURCE")),
-		KafkaBrokers:    splitBrokers(os.Getenv("KAFKA_BROKERS")),
+		KafkaBrokers:    splitList(os.Getenv("KAFKA_BROKERS")),
 		KafkaTopic:      strings.TrimSpace(os.Getenv("KAFKA_TOPIC")),
 		Lookback:        defaultLookback,
 		AheadMinutes:    defaultAheadMinutes,
 		Interval:        defaultInterval,
 		Calendar:        strings.TrimSpace(os.Getenv("CALENDAR")),
+		ShardID:         strings.TrimSpace(os.Getenv("SHARD_ID")),
+		ShardPeers:      splitList(os.Getenv("SHARD_PEERS")),
+		ShardDNS:        strings.TrimSpace(os.Getenv("SHARD_DNS")),
 	}
 	if cfg.DruidDatasource == "" {
 		cfg.DruidDatasource = defaultDatasource
@@ -102,10 +111,13 @@ func (c Config) Validate() error {
 	if c.Interval < time.Second {
 		return fmt.Errorf("INTERVAL must be at least 1s")
 	}
+	if len(c.ShardPeers) > 0 && c.ShardDNS != "" {
+		return fmt.Errorf("set either SHARD_PEERS or SHARD_DNS, not both")
+	}
 	return nil
 }
 
-func splitBrokers(s string) []string {
+func splitList(s string) []string {
 	var out []string
 	for _, p := range strings.Split(s, ",") {
 		p = strings.TrimSpace(p)

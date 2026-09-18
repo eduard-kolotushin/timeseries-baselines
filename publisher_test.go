@@ -171,3 +171,93 @@ func TestPublisherSkipsDuplicateTimestamp(t *testing.T) {
 		t.Fatalf("got %d msgs, want 1 (second tick is a duplicate ts)", len(sink.msgs))
 	}
 }
+
+// storeWith builds a fake store where every hash has a ready 1-minute series.
+func storeWith(start time.Time, hashes ...string) *fakeStore {
+	store := &fakeStore{series: make(map[string][]seriesPoint, len(hashes))}
+	for _, h := range hashes {
+		pts := minutePoints(start, 180, func(i int) float64 { return float64(i % 30) })
+		store.spans = append(store.spans, metricSpan{Hash: h, Min: pts[0].Time, Max: pts[len(pts)-1].Time})
+		store.series[h] = pts
+	}
+	return store
+}
+
+func TestPublisherWorkersOwnDisjointHashes(t *testing.T) {
+	t.Parallel()
+	hashes := corpus(64)
+	store := storeWith(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), hashes...)
+	peers := []string{"w0", "w1", "w2"}
+
+	published := make(map[string]string, len(hashes))
+	for _, self := range peers {
+		sink := &fakeSink{}
+		p := newPublisher(Config{
+			Lookback:     2 * time.Hour,
+			AheadMinutes: 1,
+			ShardID:      self,
+			ShardPeers:   peers,
+		}, store, sink, nil)
+		p.tick(context.Background())
+		for _, m := range sink.msgs {
+			if prev, ok := published[m.MetricHash]; ok {
+				t.Fatalf("hash %s published by both %s and %s", m.MetricHash, prev, self)
+			}
+			published[m.MetricHash] = self
+		}
+	}
+	if len(published) != len(hashes) {
+		t.Fatalf("published %d hashes, want all %d", len(published), len(hashes))
+	}
+}
+
+func TestPublisherStrandsShareOfAPeerThatIsNotRunning(t *testing.T) {
+	t.Parallel()
+	hashes := corpus(64)
+	store := storeWith(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), hashes...)
+
+	// Static peer list with a worker that is not running: the hashes it owns are
+	// published by nobody. This is why SHARD_PEERS must match the running
+	// workers, and why SHARD_DNS (live endpoints) is the safer k8s path.
+	sink := &fakeSink{}
+	newPublisher(Config{
+		Lookback:     2 * time.Hour,
+		AheadMinutes: 1,
+		ShardID:      "w0",
+		ShardPeers:   []string{"w0", "ghost"},
+	}, store, sink, nil).tick(context.Background())
+
+	if len(sink.msgs) == 0 || len(sink.msgs) >= len(hashes) {
+		t.Fatalf("w0 published %d of %d hashes, want its own share only", len(sink.msgs), len(hashes))
+	}
+}
+
+func TestPublisherTakesOverHashesAfterPeerLeaves(t *testing.T) {
+	t.Parallel()
+	hashes := corpus(64)
+	store := storeWith(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), hashes...)
+
+	before := &fakeSink{}
+	newPublisher(Config{
+		Lookback:     2 * time.Hour,
+		AheadMinutes: 1,
+		ShardID:      "w0",
+		ShardPeers:   []string{"w0", "w1"},
+	}, store, before, nil).tick(context.Background())
+	if len(before.msgs) == 0 || len(before.msgs) >= len(hashes) {
+		t.Fatalf("two workers: w0 published %d of %d hashes", len(before.msgs), len(hashes))
+	}
+
+	// w1 is gone, so w0 owns the whole table and must publish on the next tick.
+	after := &fakeSink{}
+	p := newPublisher(Config{
+		Lookback:     2 * time.Hour,
+		AheadMinutes: 1,
+		ShardID:      "w0",
+		ShardPeers:   []string{"w0"},
+	}, store, after, nil)
+	p.tick(context.Background())
+	if len(after.msgs) != len(hashes) {
+		t.Fatalf("after w1 left, w0 published %d of %d hashes", len(after.msgs), len(hashes))
+	}
+}

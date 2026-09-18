@@ -81,6 +81,10 @@ func TestConfigValidate(t *testing.T) {
 		{"lookback", func(c *Config) { c.Lookback = time.Second }, "LOOKBACK"},
 		{"ahead", func(c *Config) { c.AheadMinutes = 0 }, "AHEAD_MINUTES"},
 		{"interval", func(c *Config) { c.Interval = time.Millisecond }, "INTERVAL"},
+		{"shard peers and dns", func(c *Config) {
+			c.ShardPeers = []string{"a"}
+			c.ShardDNS = "baselines"
+		}, "SHARD_PEERS"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := ok
@@ -96,5 +100,39 @@ func TestConfigValidate(t *testing.T) {
 				t.Fatalf("got %v want substring %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestConfigFromEnvShards(t *testing.T) {
+	t.Setenv("DRUID_BROKER", "http://druid-broker:8082")
+	t.Setenv("KAFKA_BROKERS", "kafka:9092")
+	t.Setenv("SHARD_ID", "10.0.0.7")
+	t.Setenv("SHARD_PEERS", "10.0.0.8, 10.0.0.9")
+	t.Setenv("SHARD_DNS", "")
+	cfg, err := ConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ShardID != "10.0.0.7" {
+		t.Fatalf("SHARD_ID: %+v", cfg)
+	}
+	if len(cfg.ShardPeers) != 2 || cfg.ShardPeers[0] != "10.0.0.8" {
+		t.Fatalf("SHARD_PEERS: %+v", cfg.ShardPeers)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("SHARD_PEERS", "")
+	t.Setenv("SHARD_DNS", "baselines-headless.timeseries.svc.cluster.local")
+	cfg, err = ConfigFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ShardDNS == "" || len(cfg.ShardPeers) != 0 {
+		t.Fatalf("SHARD_DNS: %+v", cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
 	}
 }

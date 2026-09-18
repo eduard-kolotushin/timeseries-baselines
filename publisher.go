@@ -10,13 +10,14 @@ import (
 	forecast "github.com/eduard-kolotushin/timeseries-forecast"
 )
 
-// Publisher scans Druid and writes one baseline point per ready hash per tick.
+// Publisher scans Druid and writes one baseline point per ready hash it owns.
 type Publisher struct {
 	cfg       Config
 	src       metricReader
 	sink      baselineSink
 	cal       *forecast.Calendar
 	published map[string]int64
+	peers     *peerSource
 }
 
 func newPublisher(cfg Config, src metricReader, sink baselineSink, cal *forecast.Calendar) *Publisher {
@@ -26,6 +27,7 @@ func newPublisher(cfg Config, src metricReader, sink baselineSink, cal *forecast
 		sink:      sink,
 		cal:       cal,
 		published: make(map[string]int64),
+		peers:     newPeerSource(cfg),
 	}
 }
 
@@ -61,19 +63,27 @@ func (p *Publisher) tick(ctx context.Context) {
 	if err := ctx.Err(); err != nil {
 		return
 	}
+	peers := p.peers.peers(ctx)
 	spans, err := p.src.Hashes(ctx)
 	if err != nil {
 		slog.Error("list hashes", "err", err)
 		return
 	}
+	owned, skipped := 0, 0
 	for _, span := range spans {
 		if err := ctx.Err(); err != nil {
 			return
 		}
+		if !Owns(span.Hash, p.peers.self, peers) {
+			skipped++
+			continue
+		}
+		owned++
 		if err := p.publishHash(ctx, span); err != nil {
 			slog.Error("metric", "metric_hash", span.Hash, "err", err)
 		}
 	}
+	slog.Debug("tick", "shard", p.peers.self, "peers", len(peers), "owned", owned, "skipped", skipped)
 }
 
 func (p *Publisher) publishHash(ctx context.Context, span metricSpan) error {

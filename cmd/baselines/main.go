@@ -35,6 +35,9 @@ func main() {
 		"topic", cfg.KafkaTopic,
 		"interval", cfg.Interval.String(),
 		"aheadMinutes", cfg.AheadMinutes,
+		"shard", baselines.ShardID(cfg.ShardID),
+		"shardPeers", cfg.ShardPeers,
+		"shardDNS", cfg.ShardDNS,
 	)
 	pub.Run(ctx)
 }

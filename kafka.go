@@ -3,6 +3,7 @@ package baselines
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 
 	"github.com/segmentio/kafka-go"
 )
@@ -28,19 +29,22 @@ func newKafkaSink(brokers []string, topic string) *kafkaSink {
 		w: &kafka.Writer{
 			Addr:                   kafka.TCP(brokers...),
 			Topic:                  topic,
-			Balancer:               &kafka.LeastBytes{},
+			Balancer:               &kafka.Hash{},
 			AllowAutoTopicCreation: true,
 		},
 	}
 }
 
+// Publish writes one point. The key is unique per (metric_hash, metric_ts), so a
+// duplicate publish of the same point lands on the same partition and a
+// compacted topic keeps only the last record for it.
 func (s *kafkaSink) Publish(ctx context.Context, msg BaselineMessage) error {
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 	return s.w.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(msg.MetricHash),
+		Key:   []byte(msg.MetricHash + "|" + strconv.FormatInt(msg.MetricTS, 10)),
 		Value: b,
 	})
 }

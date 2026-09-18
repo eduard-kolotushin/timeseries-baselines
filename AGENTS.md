@@ -23,16 +23,21 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - Depend on `timeseries.Series[float64]` and public `forecast.FitSeasonalBaseline`; do not fork Series or models
 - Public ops do not mutate caller series
 - Source of truth is Druid SQL, not the metrics Kafka topic
-- Stay within v1 unless `docs/INTENTIONS.md` is updated first
+- Stay within v1/v2 unless `docs/INTENTIONS.md` is updated first
 - Fit in linear time; O(1) work per horizon step; pre-size series slices
+- Ownership is a pure, allocation-free function of `(metric_hash, peer set)`: a wrong peer set degrades to duplicate work or a stranded share, never to a crash or a stalled tick
 
 ## v1 in scope
 
 Env-configured ticker, skip short/non-1-minute hashes, one Kafka message at last+N minutes.
 
-## v1 out of scope
+## v2 in scope
 
-Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka, Docker/Helm packaging (see `timeseries-k8s`).
+N workers over one table by rendezvous hashing of `metric_hash` over a peer set (`SHARD_ID` / `SHARD_PEERS` / `SHARD_DNS`); Kubernetes Deployment + headless Service or VM processes; idempotency key per message and duplicate-tolerant ingestion.
+
+## v1/v2 out of scope
+
+Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka, Docker/Helm packaging (see `timeseries-k8s`), a coordinator/leader election, backfill after a restart.
 
 ## Workflow
 
