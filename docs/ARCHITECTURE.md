@@ -68,7 +68,19 @@ Both environments run the same binary and only differ in how the peer set arrive
 
 Kubernetes (`timeseries-k8s`): a worker Deployment plus a headless Service. `SHARD_ID` comes from `status.podIP` (Downward API) and `SHARD_DNS` points at the headless Service, so `kubectl scale deployment/<release>-baselines --replicas=N` is the whole operation: pods join the endpoint list, the others pick up the new view on their next tick. No replica count needs to agree with anything.
 
-VM: N processes, each with `SHARD_ID` set to its own address and `SHARD_PEERS` listing all of them, e.g. `systemd` template units `baselines@0..N-1` with `SHARD_ID=10.0.0.11`, `SHARD_PEERS=10.0.0.11,10.0.0.12`. The list must match the running workers exactly: a listed peer that is not running strands its share, and a running worker that is missing from the list makes every worker own the whole table (duplicates, absorbed by ingestion). If the VMs have a shared round-robin name or DNS, use `SHARD_DNS` instead so membership follows liveness.
+VM: N processes, each with `SHARD_ID` set to its own address and `SHARD_PEERS` listing **every** running worker, e.g. `systemd` template units `baselines@0..N-1` with `SHARD_ID=10.0.0.11`, `SHARD_PEERS=10.0.0.11,10.0.0.12`. Each worker unions only *itself* into its view, so a list that does not name exactly the running set gives workers different views, and the two deviations differ (measured on 2048 hashes with the ownership code):
+
+| `SHARD_PEERS` vs running workers | Outcome |
+| --- | --- |
+| Names peers that are not running | their share is stranded: 1253 of 2048 hashes unpublished, and 196 published by two workers |
+| Omits a running worker | 1047 of 2048 unpublished, 158 published twice |
+| A subset of the running workers (every listed peer is up, but not every worker is listed) | no strands, 691 of 2048 published twice — duplicates only |
+
+Only the last shape is harmless-by-ingestion; the first two lose lead points. If the VMs have a shared round-robin name or DNS, use `SHARD_DNS` instead so membership follows liveness.
+
+Peer views can also disagree *while* converging: with `SHARD_DNS` the endpoint list lags a restart or a scale by one tick, and a worker that starts before its own endpoint exists sees only itself and publishes everything for that tick. Both are transient duplicates, never silent loss.
+
+A membership change is not transactional, and a stale view can persist if two workers keep disagreeing (for example a `SHARD_PEERS` list that names a peer which comes back with a different identity): a hash can stay owned by a worker that is not running for longer than one tick. Confirm coverage after a scale event rather than assuming one tick.
 
 Interfaces:
 

@@ -35,18 +35,23 @@ func newKafkaSink(brokers []string, topic string) *kafkaSink {
 	}
 }
 
-// Publish writes one point. The key is unique per (metric_hash, metric_ts), so a
-// duplicate publish of the same point lands on the same partition and a
-// compacted topic keeps only the last record for it.
+// Publish writes one point.
 func (s *kafkaSink) Publish(ctx context.Context, msg BaselineMessage) error {
 	b, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 	return s.w.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(msg.MetricHash + "|" + strconv.FormatInt(msg.MetricTS, 10)),
+		Key:   messageKey(msg),
 		Value: b,
 	})
+}
+
+// messageKey is unique per published point, so a duplicate publish of the same
+// (metric_hash, metric_ts) lands on the same partition and a compacted topic
+// keeps only the last record for it. One point, one key, across restarts.
+func messageKey(msg BaselineMessage) []byte {
+	return []byte(msg.MetricHash + "|" + strconv.FormatInt(msg.MetricTS, 10))
 }
 
 func (s *kafkaSink) Close() error {

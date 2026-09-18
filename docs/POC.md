@@ -47,6 +47,10 @@ computes the same answer from the same set alone.
 - Kafka with the `baselines` topic
 - The Druid Kafka supervisor for `baselines` using `"type": "doubleMax"` for `baseline_value` with
   `"queryGranularity": "minute"` and `"rollup": true` (see the sandbox `druid/baselines-supervisor.json`)
+  - Changing that aggregator needs more than editing the file: re-submit the spec **and** re-index the
+    datasource (reset the supervisor, or rebuild it). Rollup is applied at ingestion, so minutes that are
+    already stored keep the old aggregation — a stack indexed with `doubleSum` holds doubled values that no
+    dashboard query can undo. Submitting a supervisor spec only affects new ingestion.
 - Optional: the sandbox stack (`make up`, `make refresh`) for the dashboard and `make baselines`
 
 | Env | Meaning |
@@ -158,8 +162,8 @@ workers. Remove `w2` from `SHARD_PEERS` (and restart the units) to watch coverag
 ## Step 2 — Kubernetes: scale a Deployment
 
 Mode: `SHARD_DNS`. The chart gives the worker its own Deployment plus a headless Service; `SHARD_ID` is the
-pod IP (`status.podIP`) and `SHARD_DNS` resolves to the same pod IPs, so the identity and the DNS answer
-always agree.
+pod IP (`status.podIP`) and `SHARD_DNS` is the bare Service name, which resolves through the pod's search
+domains — so it works on a cluster with a custom `--cluster-domain` too.
 
 ```bash
 # from timeseries-k8s
@@ -217,12 +221,16 @@ Expected after each change: the surviving/new workers pick up their share on the
 or restart some hashes are published by both the old and the new owner for one tick; ingestion collapses
 those. On scale-down the departing share is silent for at most one tick.
 
+`kubectl scale` changes the live replica count only: the next `helm upgrade` resets `replicas` to
+`baselines.replicas`, so pass the intended count there (`--set baselines.replicas=N`) or scale again after the
+upgrade.
+
 ### Negative control (k8s) — the same identity twice
 
 ```bash
 kubectl -n timeseries set env deployment/timeseries-baselines SHARD_DNS=   # every pod now owns everything
 # later:
-kubectl -n timeseries set env deployment/timeseries-baselines SHARD_DNS=timeseries-baselines-headless.timeseries.svc.cluster.local
+kubectl -n timeseries set env deployment/timeseries-baselines SHARD_DNS=timeseries-baselines-headless
 ```
 
 Expected: with discovery off, every pod publishes every hash — the Kafka duplicate check below fills up with

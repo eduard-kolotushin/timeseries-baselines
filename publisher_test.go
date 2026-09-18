@@ -2,6 +2,7 @@ package baselines
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -259,5 +260,26 @@ func TestPublisherTakesOverHashesAfterPeerLeaves(t *testing.T) {
 	p.tick(context.Background())
 	if len(after.msgs) != len(hashes) {
 		t.Fatalf("after w1 left, w0 published %d of %d hashes", len(after.msgs), len(hashes))
+	}
+}
+
+func TestPublisherRunsUnshardedWhenPeerLookupFails(t *testing.T) {
+	t.Parallel()
+	hashes := corpus(32)
+	store := storeWith(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), hashes...)
+	sink := &fakeSink{}
+	p := newPublisher(Config{
+		Lookback:     2 * time.Hour,
+		AheadMinutes: 1,
+		ShardID:      "10.0.0.1",
+		ShardDNS:     "baselines-headless",
+	}, store, sink, nil)
+	p.peers.resolver = &fakeResolver{err: errors.New("no such host")}
+
+	// A lookup that fails with no last good set must not stall the tick: the
+	// worker publishes everything, which costs duplicate work but no lead points.
+	p.tick(context.Background())
+	if len(sink.msgs) != len(hashes) {
+		t.Fatalf("worker published %d of %d hashes after a failed lookup", len(sink.msgs), len(hashes))
 	}
 }

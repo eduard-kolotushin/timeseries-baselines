@@ -23,16 +23,9 @@ func TestOwnsPartitionsEveryHashOnce(t *testing.T) {
 		for i := range n {
 			peers[i] = fmt.Sprintf("worker-%d", i)
 		}
-		owners := make(map[string]int, len(hashes))
 		for _, h := range hashes {
-			owners[h]++
-			if got := Owner(h, peers); got == "" {
+			if Owner(h, peers) == "" {
 				t.Fatalf("%d peers: hash %s has no owner", n, h)
-			}
-		}
-		for _, h := range hashes {
-			if owners[h] != 1 {
-				t.Fatalf("%d peers: hash %s owned %d times by Owner", n, h, owners[h])
 			}
 		}
 		claimed := make(map[string]int, len(hashes))
@@ -88,12 +81,16 @@ func TestOwnsKeepsMostHashesWhenPeerAdded(t *testing.T) {
 	}
 }
 
-func TestOwnsIsDeterministic(t *testing.T) {
+func TestOwnsIgnoresPeerOrder(t *testing.T) {
 	t.Parallel()
-	peers := []string{"a", "b", "c"}
-	for _, h := range corpus(64) {
-		if Owner(h, peers) != Owner(h, peers) {
-			t.Fatalf("hash %s: owner is not stable", h)
+	// A worker's view arrives sorted, but a bug in the score tie-break would
+	// make the answer depend on iteration order instead of the names.
+	hashes := corpus(256)
+	peers := []string{"a", "b", "c", "d"}
+	permuted := []string{"d", "a", "c", "b"}
+	for _, h := range hashes {
+		if got, want := Owner(h, permuted), Owner(h, peers); got != want {
+			t.Fatalf("hash %s: owner %q with permuted peers, %q in the original order", h, got, want)
 		}
 	}
 }
@@ -193,6 +190,12 @@ func TestPeerSourceModes(t *testing.T) {
 			cfg:      Config{ShardID: "10.0.0.1", ShardDNS: "baselines"},
 			resolver: &fakeResolver{addrs: []string{"10.0.0.2", "10.0.0.1"}},
 			want:     []string{"10.0.0.1", "10.0.0.2"},
+		},
+		{
+			name:     "dns answer that omits self still includes it",
+			cfg:      Config{ShardID: "10.0.0.9", ShardDNS: "baselines"},
+			resolver: &fakeResolver{addrs: []string{"10.0.0.2", "10.0.0.3"}},
+			want:     []string{"10.0.0.2", "10.0.0.3", "10.0.0.9"},
 		},
 		{
 			name:     "dns failure runs unsharded",

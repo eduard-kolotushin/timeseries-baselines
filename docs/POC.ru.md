@@ -47,6 +47,11 @@ worker получает один и тот же ответ, зная тольк�
 - Kafka с топиком `baselines`
 - Druid Kafka supervisor для `baselines` с `"type": "doubleMax"` для `baseline_value`,
   `"queryGranularity": "minute"` и `"rollup": true` (см. `druid/baselines-supervisor.json` в песочнице)
+  - Смена этого агрегатора требует большего, чем правка файла: нужно заново отправить спецификацию **и**
+    переиндексировать источник (сбросить supervisor или пересобрать его). Rollup применяется при ингесте,
+    поэтому уже сохранённые минуты сохраняют старую агрегацию — стенд, проиндексированный с `doubleSum`,
+    хранит удвоенные значения, и никакой запрос дашборда это не исправит. Отправка спецификации влияет
+    только на новый ингест.
 - Опционально: стек песочницы (`make up`, `make refresh`) для дашборда и `make baselines`
 
 | Переменная | Значение |
@@ -160,7 +165,8 @@ systemctl stop baselines@w2
 ## Шаг 2 — Kubernetes: масштабирование Deployment
 
 Режим: `SHARD_DNS`. Чарт даёт worker'у собственный Deployment и headless-сервис: `SHARD_ID` — это IP пода
-(`status.podIP`), а `SHARD_DNS` резолвится в те же IP, поэтому идентификатор и ответ DNS всегда совпадают.
+(`status.podIP`), а `SHARD_DNS` — короткое имя сервиса, которое резолвится через search-домены пода, поэтому
+работает и на кластере с нестандартным `--cluster-domain`.
 
 ```bash
 # из timeseries-k8s
@@ -218,12 +224,16 @@ kubectl -n timeseries rollout restart deployment/timeseries-baselines       # н
 масштабировании вверх или рестарте часть хэшей один тик публикуют и старый, и новый владелец — ингест их
 сворачивает. При уменьшении числа реплик доля ушедшего молчит не более одного тика.
 
+`kubectl scale` меняет только текущее число реплик: следующий `helm upgrade` вернёт `replicas` к значению
+`baselines.replicas`, поэтому задавайте нужное число там (`--set baselines.replicas=N`) или повторите
+масштабирование после апгрейда.
+
 ### Негативный контроль (k8s) — один и тот же идентификатор дважды
 
 ```bash
 kubectl -n timeseries set env deployment/timeseries-baselines SHARD_DNS=   # теперь каждый под владеет всем
 # позже:
-kubectl -n timeseries set env deployment/timeseries-baselines SHARD_DNS=timeseries-baselines-headless.timeseries.svc.cluster.local
+kubectl -n timeseries set env deployment/timeseries-baselines SHARD_DNS=timeseries-baselines-headless
 ```
 
 Ожидается: без обнаружения участников каждый под публикует каждый хэш — проверка на дубликаты ниже
