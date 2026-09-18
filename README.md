@@ -7,6 +7,7 @@ One process owns every hash, or N processes share the table by rendezvous hashin
 This is **not** a Grafana plugin. Grafana overlays live in [`timeseries-grafana`](../timeseries-grafana). Local Compose lives in [`timeseries-grafana-sandbox`](../timeseries-grafana-sandbox). The cluster worker image and Helm chart live in [`timeseries-k8s`](../timeseries-k8s).
 
 See [docs/INTENTIONS.md](docs/INTENTIONS.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Runbook for the sharded deployment on VM and Kubernetes: [docs/POC.md](docs/POC.md) (English) / [docs/POC.ru.md](docs/POC.ru.md) (Русский).
 
 Depends on tagged `timeseries` and `timeseries-forecast` modules.
 
