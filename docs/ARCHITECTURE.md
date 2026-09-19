@@ -37,7 +37,7 @@ N workers share one table. Each tick every worker resolves the same peer set and
 - Ownership is rendezvous ("highest random weight") hashing: `owner(hash) = argmax(avalanche(fnv1a(hash + "|" + peer)))` over the peers. Any worker computes it from the peer set alone — no coordinator, no lock, no shared state.
 - Adding or removing one peer moves about `1/N` of the hashes (measured: 204 of 1024 hashes move when a fifth peer joins), so a scale event only re-fits that share.
 - The peer set is `SHARD_PEERS` (explicit identities, for VMs) or the `SHARD_DNS` A records (headless Service in Kubernetes, Compose service name for a scaled Compose service), else the worker alone. Set both and the process refuses to start.
-- `SHARD_ID` is the worker identity and defaults to the first non-loopback IP, which is what `SHARD_DNS` returns in a container or pod. Kubernetes sets it from `status.podIP` so the identity matches the DNS records exactly. Two workers on one host share that default and would be the same peer, so co-located processes need explicit `SHARD_ID` values.
+- `SHARD_ID` is the worker identity and defaults to the first non-loopback IP, which is what `SHARD_DNS` returns in a container or pod. Kubernetes sets it from `status.podIP` so the identity matches the DNS records exactly. Two workers on one host share that default and would be the same peer, so co-located processes need explicit `SHARD_ID` values. The same holds across networks: two VMs in different VPCs can both report `10.0.0.5`, which merges them into one peer whose share both of them publish, so a multi-VM fleet names every worker explicitly.
 - A worker always adds itself to its peer set, so it never idles out of the table. Two workers that see the same peers publish **disjoint** sets that cover every hash.
 - A failed lookup keeps the last good set. With no last good set yet, the worker runs unsharded (owns everything) and logs a warning: duplicate work beats a stalled tick, and the next successful lookup restores sharding.
 
@@ -49,6 +49,8 @@ What sharding does and does not divide:
 | `Series` load, fit, publish, for owned hashes | divided by about N |
 
 The scan is the price of eligibility (`min(__time)` over all history). Pushing the shard predicate into the SQL (`fnv_hash(metric_hash) % N`) would shrink the response but not the scan, so it is not used: ownership stays in Go, portable and testable.
+
+Two invariants follow from where the checks sit. Eligibility is tested *after* ownership (`tick` asks `Owns` first and `publishHash` applies the lookback), so `LOOKBACK` must be identical fleet-wide — an owner with a shorter lookback drops a hash that no other worker will pick up. And a static peer list must be edited *before* a process is stopped: a listed name with no process strands its share, whereas adding a name only duplicates points until the views converge.
 
 Membership changes are not transactional. A handover costs at most one tick for the hashes that moved: the new owner starts publishing its own `last + N`, and the old owner may publish the same point once more while its view is stale. There is no backfill; the dashboard shows a lead series, not a per-minute ledger.
 

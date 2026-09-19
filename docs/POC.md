@@ -123,7 +123,22 @@ Expected in each startup line: `shard=w0 shardPeers="[w0 w1 w2]" shardDNS=""` (o
 `w1`/`w2` respectively), then no further output while the stack is healthy.
 
 Two processes on **one host** would auto-detect the same identity, so with a static list always set
-`SHARD_ID` explicitly per instance (the unit above does). On separate VMs the default would work.
+`SHARD_ID` explicitly per instance (the unit above does). Give separate VMs explicit identities too: the
+default is the first non-loopback IP, and two VMs in different networks can report the same private address —
+they then count as one peer and each duplicates the other's share.
+
+A static fleet only agrees if every worker is configured identically:
+
+- the **same** `SHARD_PEERS` (the whole fleet, each worker included) and unique `SHARD_ID`s, or two workers
+  compute different owners for the same hash;
+- the **same** `LOOKBACK`. Eligibility runs *after* ownership, so a hash owned by a worker with a shorter
+  lookback is published by nobody;
+- the same `DRUID_BROKER`, `DRUID_DATASOURCE`, `KAFKA_BROKERS`, and `KAFKA_TOPIC` — otherwise the workers are
+  not sharing one table at all.
+
+Change the list **before** stopping a process: a name that is listed but has no process strands its share
+silently. Adding a worker is safe in either order — while the old and new lists disagree the worst case is a
+duplicate point, which `doubleMax` swallows.
 
 ### Verify the split from the data
 
