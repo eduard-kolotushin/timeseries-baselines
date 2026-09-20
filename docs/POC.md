@@ -6,6 +6,21 @@ Proof of concept for the v2 scaling model of `timeseries-baselines`: **N workers
 rendezvous hashing of `metric_hash`**, with no coordinator, no lock and no shared state.
 Behaviour described here: worker `052c1a8`, chart value `baselines.replicas`.
 
+> **v3 update.** v3 changes what a tick does, not how ownership works, so every check below still holds.
+> Read it together with these differences:
+>
+> - A tick no longer fits and publishes per hash. It scans, claims due retrains, and publishes from a stored
+>   snapshot; with `BASELINE_STORE_*` set, publishing issues **zero** Druid requests and survives a Druid outage.
+> - Every Druid request is windowed and bounded (`DRUID_MAX_RANGE`, `DRUID_MAX_RPS`, `DRUID_MAX_INFLIGHT`,
+>   `DRUID_TIMEOUT`, `DRUID_RETRIES`). The scan is windowed too, so the eligibility span is `SCAN_RANGE`
+>   (default `max(2*LOOKBACK, 24h)`), not all history: a hash whose data ended before `now - SCAN_RANGE` stops
+>   being eligible.
+> - The published timestamp is minute-truncated `now` + `AHEAD_MINUTES`, not the last observed point + N.
+> - `SHARD_MEMBERSHIP` (`auto` by default) selects the peer source: `SHARD_PEERS`, then `SHARD_DNS`, then the
+>   Postgres heartbeat (`store`), then this worker alone. **`store` is the recommended VM path**: the peer set is
+>   the `baselines.workers` rows seen within `WORKER_TTL` (default `max(30s, 2*INTERVAL)`), so join/leave needs no list edit.
+> - `SHARD_PEERS` / `SHARD_DNS` still behave exactly as described below, including the negative controls.
+
 ## What this POC proves
 
 | Claim | How it is checked here |
@@ -57,11 +72,17 @@ computes the same answer from the same set alone.
 | --- | --- |
 | `DRUID_BROKER`, `DRUID_DATASOURCE`, `KAFKA_BROKERS`, `KAFKA_TOPIC` | Same as v1 |
 | `LOOKBACK`, `AHEAD_MINUTES`, `INTERVAL`, `CALENDAR` | Same as v1 |
+| `DRUID_MAX_RANGE`, `DRUID_MAX_RPS`, `DRUID_MAX_INFLIGHT`, `DRUID_TIMEOUT`, `DRUID_RETRIES` | v3 Druid bounds: maximum span per request, requests per second, concurrent requests, client timeout, retries |
+| `HASH_SCAN_TTL`, `SCAN_RANGE` | v3 scan cache and eligibility window |
+| `BASELINE_STORE_*` | v3 Postgres snapshot/retrain/membership store (falls back per field to `FORECAST_STORE_*`). Unset: fit-and-publish per tick, v1/v2 behaviour |
+| `DEFAULT_RETRAIN_CRON`, `RETRAIN_RETRY`, `TRAIN_CONCURRENCY`, `SNAPSHOT_CACHE_TTL` | v3 retrain schedule, retry/lease delay, concurrent retrains, snapshot freshness probe |
+| `SHARD_MEMBERSHIP` | `auto` (default), `peers`, `dns`, or `store` |
+| `WORKER_TTL` | A `baselines.workers` row is a peer while it was seen within this (default `max(30s, 2*INTERVAL)`, and always longer than `INTERVAL`) |
 | `SHARD_ID` | This worker's identity. Default: first non-loopback IP |
 | `SHARD_PEERS` | Comma-separated peer identities (VM mode) |
 | `SHARD_DNS` | Name whose A records are the peer set (Kubernetes headless Service, Compose service name) |
 
-Empty `SHARD_PEERS` and `SHARD_DNS` mean one worker owns every hash. Setting both is a startup error.
+Empty `SHARD_PEERS`, `SHARD_DNS`, and store mean one worker owns every hash. Setting both `SHARD_PEERS` and `SHARD_DNS` is a startup error.
 
 ## Step 0 — local check, no Druid and no Kafka (~1 s)
 

@@ -23,7 +23,10 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - Depend on `timeseries.Series[float64]` and public `forecast.FitSeasonalBaseline`; do not fork Series or models
 - Public ops do not mutate caller series
 - Source of truth is Druid SQL, not the metrics Kafka topic
-- Stay within v1/v2 unless `docs/INTENTIONS.md` is updated first
+- Stay within v1/v2/v3 unless `docs/INTENTIONS.md` is updated first
+- Every Druid request is windowed and bounded (`DRUID_MAX_RANGE`, `DRUID_MAX_RPS`, `DRUID_MAX_INFLIGHT`, `DRUID_TIMEOUT`, `DRUID_RETRIES`); never re-introduce an unbounded `SELECT` or a `COUNT(*)` pre-size probe
+- Postgres holds snapshots, the retrain queue and the membership heartbeat. The worker creates only schema `baselines`; `forecast.retrain` is created and owned by `timeseries-grafana`, and this process only reads, claims and finishes rows in it
+- The worker still exposes no HTTP surface
 - Fit in linear time; O(1) work per horizon step; pre-size series slices
 - Ownership is a pure, allocation-free function of `(metric_hash, peer set)`: a wrong peer set degrades to duplicate work or a stranded share, never to a crash or a stalled tick
 
@@ -35,9 +38,13 @@ Env-configured ticker, skip short/non-1-minute hashes, one Kafka message at last
 
 N workers over one table by rendezvous hashing of `metric_hash` over a peer set (`SHARD_ID` / `SHARD_PEERS` / `SHARD_DNS`); Kubernetes Deployment + headless Service or VM processes; idempotency key per message and duplicate-tolerant ingestion.
 
-## v1/v2 out of scope
+## v3 in scope
 
-Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka, Docker/Helm packaging (see `timeseries-k8s`), a coordinator/leader election, backfill after a restart.
+Train on a schedule, persist the fit, publish from the snapshot. Bounded Druid access (`DRUID_MAX_RANGE` slicing, rate/inflight caps, retry, timeout, optional static auth header), Postgres snapshot store (`baselines.snapshots`, gzip `forecast.Snapshot`), scheduled retrain with a fleet-wide `FOR UPDATE SKIP LOCKED` claim queue on `forecast.retrain`, Postgres-heartbeat membership (`baselines.workers`, `SHARD_MEMBERSHIP=store`), and a publish timestamp of minute-truncated `now` + `AHEAD_MINUTES`.
+
+## v1/v2/v3 out of scope
+
+Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka, Docker/Helm packaging (see `timeseries-k8s`), a coordinator/leader election for ownership, backfill after a restart, an HTTP endpoint or health probe, more than one shared Postgres.
 
 ## Workflow
 

@@ -1,8 +1,6 @@
 package baselines
 
 import (
-	"context"
-	"log/slog"
 	"net"
 	"os"
 	"sort"
@@ -153,55 +151,4 @@ func localIP() string {
 		}
 	}
 	return fallback
-}
-
-// resolver looks up the addresses behind SHARD_DNS.
-type resolver interface {
-	LookupHost(ctx context.Context, host string) ([]string, error)
-}
-
-// peerSource is the membership seen by one worker: SHARD_PEERS when set, else
-// the addresses behind SHARD_DNS, else this worker alone. A failed lookup keeps
-// the last good set; with no last good set the worker runs unsharded, which
-// costs duplicate work but never stalls a tick.
-type peerSource struct {
-	self     string
-	static   []string
-	dnsName  string
-	resolver resolver
-	last     []string
-	warned   bool
-}
-
-func newPeerSource(cfg Config) *peerSource {
-	return &peerSource{
-		self:     ShardID(cfg.ShardID),
-		static:   cfg.ShardPeers,
-		dnsName:  cfg.ShardDNS,
-		resolver: net.DefaultResolver,
-	}
-}
-
-func (s *peerSource) peers(ctx context.Context) []string {
-	if s.dnsName == "" || s.resolver == nil {
-		return normalizePeers(s.static, s.self)
-	}
-	addrs, err := s.resolver.LookupHost(ctx, s.dnsName)
-	if err != nil || len(addrs) == 0 {
-		if len(s.last) > 0 {
-			if !s.warned {
-				slog.Warn("peer lookup failed, keeping last peer set", "name", s.dnsName, "err", err)
-				s.warned = true
-			}
-			return s.last
-		}
-		if !s.warned {
-			slog.Warn("peer lookup failed, running unsharded", "name", s.dnsName, "err", err)
-			s.warned = true
-		}
-		return normalizePeers(nil, s.self)
-	}
-	s.warned = false
-	s.last = normalizePeers(addrs, s.self)
-	return s.last
 }

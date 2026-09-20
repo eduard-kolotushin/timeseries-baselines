@@ -1,8 +1,6 @@
 package baselines
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"testing"
 )
@@ -149,98 +147,5 @@ func TestShardIDPrefersExplicit(t *testing.T) {
 	}
 	if got := ShardID(""); got == "" {
 		t.Fatal("automatic shard id is empty")
-	}
-}
-
-type fakeResolver struct {
-	addrs []string
-	err   error
-}
-
-func (f *fakeResolver) LookupHost(context.Context, string) ([]string, error) {
-	return f.addrs, f.err
-}
-
-func TestPeerSourceModes(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		name     string
-		cfg      Config
-		resolver *fakeResolver
-		want     []string
-	}{
-		{
-			name: "single worker without discovery",
-			cfg:  Config{ShardID: "self"},
-			want: []string{"self"},
-		},
-		{
-			name: "static peers include self",
-			cfg:  Config{ShardID: "b", ShardPeers: []string{"a", "c"}},
-			want: []string{"a", "b", "c"},
-		},
-		{
-			name:     "static peers win over the resolver",
-			cfg:      Config{ShardID: "b", ShardPeers: []string{"a"}},
-			resolver: &fakeResolver{addrs: []string{"9.9.9.9"}},
-			want:     []string{"a", "b"},
-		},
-		{
-			name:     "dns peers",
-			cfg:      Config{ShardID: "10.0.0.1", ShardDNS: "baselines"},
-			resolver: &fakeResolver{addrs: []string{"10.0.0.2", "10.0.0.1"}},
-			want:     []string{"10.0.0.1", "10.0.0.2"},
-		},
-		{
-			name:     "dns answer that omits self still includes it",
-			cfg:      Config{ShardID: "10.0.0.9", ShardDNS: "baselines"},
-			resolver: &fakeResolver{addrs: []string{"10.0.0.2", "10.0.0.3"}},
-			want:     []string{"10.0.0.2", "10.0.0.3", "10.0.0.9"},
-		},
-		{
-			name:     "dns failure runs unsharded",
-			cfg:      Config{ShardID: "10.0.0.1", ShardDNS: "baselines"},
-			resolver: &fakeResolver{err: errors.New("no such host")},
-			want:     []string{"10.0.0.1"},
-		},
-		{
-			name:     "empty dns answer runs unsharded",
-			cfg:      Config{ShardID: "10.0.0.1", ShardDNS: "baselines"},
-			resolver: &fakeResolver{},
-			want:     []string{"10.0.0.1"},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			src := newPeerSource(tc.cfg)
-			if tc.resolver != nil {
-				src.resolver = tc.resolver
-			}
-			got := src.peers(context.Background())
-			if len(got) != len(tc.want) {
-				t.Fatalf("got %v want %v", got, tc.want)
-			}
-			for i := range got {
-				if got[i] != tc.want[i] {
-					t.Fatalf("got %v want %v", got, tc.want)
-				}
-			}
-		})
-	}
-}
-
-func TestPeerSourceKeepsLastGoodPeers(t *testing.T) {
-	t.Parallel()
-	res := &fakeResolver{addrs: []string{"10.0.0.2"}}
-	src := newPeerSource(Config{ShardID: "10.0.0.1", ShardDNS: "baselines"})
-	src.resolver = res
-
-	first := src.peers(context.Background())
-	if len(first) != 2 {
-		t.Fatalf("resolved peers %v want 2", first)
-	}
-	res.err = errors.New("dns down")
-	second := src.peers(context.Background())
-	if len(second) != 2 {
-		t.Fatalf("peers after lookup failure %v want the last good set", second)
 	}
 }

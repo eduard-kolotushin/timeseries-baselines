@@ -6,10 +6,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/eduard-kolotushin/timeseries"
+)
+
+const (
+	druidRetryBackoff    = 250 * time.Millisecond
+	druidRetryMaxBackoff = 2 * time.Second
 )
 
 type metricSpan struct {
@@ -18,122 +27,242 @@ type metricSpan struct {
 	Max  time.Time
 }
 
-type seriesPoint struct {
-	Time  time.Time
-	Value float64
-}
-
+// metricReader is the Druid access the publisher needs. Both calls take a
+// window because the caller, not the store, owns the range: the production
+// datasource caps how far one request may reach, so every query is sliced.
 type metricReader interface {
-	Hashes(ctx context.Context) ([]metricSpan, error)
-	Series(ctx context.Context, hash string, from time.Time) ([]seriesPoint, error)
+	Hashes(ctx context.Context, from, to time.Time) ([]metricSpan, error)
+	Series(ctx context.Context, hash string, from, to time.Time) (timeseries.Series[float64], error)
 }
 
 type druidStore struct {
 	broker     string
 	datasource string
 	client     *http.Client
+	maxRange   time.Duration
+	retries    int
+	authHeader string
+	authValue  string
+	sem        *semaphore
+	rl         *rateLimiter
 }
 
-func newDruidStore(broker, datasource string, client *http.Client) *druidStore {
+func newDruidStore(cfg Config, client *http.Client) *druidStore {
+	cfg = cfg.normalized()
 	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+		client = &http.Client{Timeout: cfg.DruidTimeout}
 	}
 	return &druidStore{
-		broker:     strings.TrimRight(broker, "/"),
-		datasource: datasource,
+		broker:     strings.TrimRight(cfg.DruidBroker, "/"),
+		datasource: cfg.DruidDatasource,
 		client:     client,
+		maxRange:   cfg.DruidMaxRange,
+		retries:    cfg.DruidRetries,
+		authHeader: cfg.DruidAuthHeader,
+		authValue:  cfg.DruidAuthValue,
+		sem:        newSemaphore(cfg.DruidMaxInflight),
+		rl:         newRateLimiter(cfg.DruidMaxRPS),
 	}
 }
 
-func (d *druidStore) Hashes(ctx context.Context) ([]metricSpan, error) {
-	q := fmt.Sprintf(
-		`SELECT metric_hash, MIN(__time) AS tmin, MAX(__time) AS tmax FROM %s GROUP BY 1`,
-		d.datasource,
-	)
-	rows, err := d.sql(ctx, q)
-	if err != nil {
-		return nil, err
+// windows splits [from, to) into consecutive half-open windows of at most
+// maxRange. Half-open bounds are what makes stitching safe: no row can be
+// returned twice, so Concat only fails on a datasource that itself duplicates or
+// reorders timestamps. maxRange <= 0 keeps one window, which is one request.
+func windows(from, to time.Time, maxRange time.Duration) [][2]time.Time {
+	from, to = from.UTC(), to.UTC()
+	if maxRange <= 0 || !to.After(from) {
+		return [][2]time.Time{{from, to}}
 	}
-	out := make([]metricSpan, 0, len(rows))
-	for _, row := range rows {
-		hash := asString(row["metric_hash"])
-		minT, err := parseDruidTime(row["tmin"])
-		if err != nil || hash == "" {
-			continue
+	out := make([][2]time.Time, 0, int(math.Ceil(float64(to.Sub(from))/float64(maxRange))))
+	for lo := from; lo.Before(to); {
+		hi := lo.Add(maxRange)
+		if hi.After(to) {
+			hi = to
 		}
-		maxT, err := parseDruidTime(row["tmax"])
-		if err != nil {
-			continue
-		}
-		out = append(out, metricSpan{Hash: hash, Min: minT, Max: maxT})
+		out = append(out, [2]time.Time{lo, hi})
+		lo = hi
 	}
-	return out, nil
+	return out
 }
 
-func (d *druidStore) Series(ctx context.Context, hash string, from time.Time) ([]seriesPoint, error) {
+// Series returns the metric_hash series over [from, to), one Druid request per
+// window. The result is stitched in order, so an overlapping or out-of-order
+// window fails loudly (timeseries.ErrDuplicateTime/ErrUnsorted) instead of
+// quietly feeding the fit duplicated points.
+func (d *druidStore) Series(ctx context.Context, hash string, from, to time.Time) (timeseries.Series[float64], error) {
 	esc := strings.ReplaceAll(hash, `'`, `''`)
-	fromMs := from.UTC().UnixMilli()
-	countQ := fmt.Sprintf(
-		`SELECT COUNT(*) AS c FROM %s WHERE metric_hash = '%s' AND __time >= MILLIS_TO_TIMESTAMP(%d)`,
-		d.datasource, esc, fromMs,
-	)
-	countRows, err := d.sql(ctx, countQ)
-	if err != nil {
-		return nil, err
-	}
-	n := 0
-	if len(countRows) > 0 {
-		n = asInt(countRows[0]["c"], 0)
-	}
-	if n <= 0 {
-		return nil, nil
-	}
-	q := fmt.Sprintf(
-		`SELECT __time, metric_value FROM %s WHERE metric_hash = '%s' AND __time >= MILLIS_TO_TIMESTAMP(%d) ORDER BY __time`,
-		d.datasource, esc, fromMs,
-	)
-	rows, err := d.sql(ctx, q)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]seriesPoint, 0, n)
-	for _, row := range rows {
-		t, err := parseDruidTime(row["__time"])
+	var out timeseries.Series[float64]
+	for _, w := range windows(from, to, d.maxRange) {
+		lo, hi := w[0], w[1]
+		q := fmt.Sprintf(
+			`SELECT __time, metric_value FROM %s WHERE metric_hash = '%s' AND __time >= MILLIS_TO_TIMESTAMP(%d) AND __time < MILLIS_TO_TIMESTAMP(%d) ORDER BY __time`,
+			d.datasource, esc, lo.UnixMilli(), hi.UnixMilli(),
+		)
+		rows, err := d.sql(ctx, "series", q, lo, hi)
 		if err != nil {
-			continue
+			return timeseries.Series[float64]{}, err
 		}
-		out = append(out, seriesPoint{Time: t, Value: asFloat(row["metric_value"])})
+		// A window of this size holds at most one row per minute.
+		n := int(hi.Sub(lo)/time.Minute) + 1
+		times := make([]time.Time, 0, n)
+		values := make([]float64, 0, n)
+		for _, row := range rows {
+			t, err := parseDruidTime(row["__time"])
+			if err != nil {
+				continue
+			}
+			times = append(times, t)
+			values = append(values, asFloat(row["metric_value"]))
+		}
+		part, err := timeseries.New(times, values)
+		if err != nil {
+			return timeseries.Series[float64]{}, err
+		}
+		if out, err = timeseries.Concat(out, part); err != nil {
+			return timeseries.Series[float64]{}, fmt.Errorf("metric_hash %s: %w", hash, err)
+		}
 	}
 	return out, nil
 }
 
-func (d *druidStore) sql(ctx context.Context, query string) ([]map[string]any, error) {
+// Hashes reports the metric_hash spans seen in [from, to), merged across
+// windows: Min is the earliest and Max the latest sighting. Because the scan
+// window is bounded, Min is clamped to the window start, so a hash whose data
+// ended before now-SCAN_RANGE is no longer reported as eligible.
+func (d *druidStore) Hashes(ctx context.Context, from, to time.Time) ([]metricSpan, error) {
+	out := make([]metricSpan, 0, 64)
+	index := make(map[string]int, 64)
+	for _, w := range windows(from, to, d.maxRange) {
+		lo, hi := w[0], w[1]
+		q := fmt.Sprintf(
+			`SELECT metric_hash, MIN(__time) AS tmin, MAX(__time) AS tmax FROM %s WHERE __time >= MILLIS_TO_TIMESTAMP(%d) AND __time < MILLIS_TO_TIMESTAMP(%d) GROUP BY 1`,
+			d.datasource, lo.UnixMilli(), hi.UnixMilli(),
+		)
+		rows, err := d.sql(ctx, "hashes", q, lo, hi)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			hash := asString(row["metric_hash"])
+			if hash == "" {
+				continue
+			}
+			minT, err := parseDruidTime(row["tmin"])
+			if err != nil {
+				continue
+			}
+			maxT, err := parseDruidTime(row["tmax"])
+			if err != nil {
+				continue
+			}
+			i, ok := index[hash]
+			if !ok {
+				index[hash] = len(out)
+				out = append(out, metricSpan{Hash: hash, Min: minT, Max: maxT})
+				continue
+			}
+			if minT.Before(out[i].Min) {
+				out[i].Min = minT
+			}
+			if maxT.After(out[i].Max) {
+				out[i].Max = maxT
+			}
+		}
+	}
+	return out, nil
+}
+
+// sql runs one Druid SQL statement under the concurrency semaphore and the rate
+// limiter, retrying transport errors and 5xx only: a 4xx means the query is
+// wrong, so retrying it repeats the same failure.
+func (d *druidStore) sql(ctx context.Context, op, query string, from, to time.Time) ([]map[string]any, error) {
 	body, err := json.Marshal(map[string]string{"query": query})
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.broker+"/druid/v2/sql", bytes.NewReader(body))
+	release, err := d.sem.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer release()
+
+	var lastErr error
+	for attempt := 0; attempt <= d.retries; attempt++ {
+		if attempt > 0 {
+			if err := sleepCtx(ctx, retryBackoff(attempt)); err != nil {
+				return nil, err
+			}
+		}
+		if err := d.rl.wait(ctx); err != nil {
+			return nil, err
+		}
+		rows, retryable, err := d.do(ctx, op, body, from, to)
+		if err == nil {
+			return rows, nil
+		}
+		lastErr = err
+		if !retryable {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// do performs one request. The returned flag reports whether a retry could
+// plausibly succeed.
+func (d *druidStore) do(ctx context.Context, op string, body []byte, from, to time.Time) ([]map[string]any, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.broker+"/druid/v2/sql", bytes.NewReader(body))
+	if err != nil {
+		return nil, false, err
+	}
 	req.Header.Set("Content-Type", "application/json")
+	if d.authHeader != "" {
+		req.Header.Set(d.authHeader, d.authValue)
+	}
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, true, err
+	}
+	if resp.StatusCode >= 500 {
+		return nil, true, fmt.Errorf("druid sql: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("druid sql: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+		return nil, false, fmt.Errorf("druid sql: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
 	var rows []map[string]any
 	if err := json.Unmarshal(raw, &rows); err != nil {
-		return nil, fmt.Errorf("druid sql decode: %w", err)
+		return nil, false, fmt.Errorf("druid sql decode: %w", err)
 	}
-	return rows, nil
+	slog.Debug("druid request", "op", op, "from", from, "to", to)
+	return rows, false, nil
+}
+
+// retryBackoff is the delay before attempt n (1-based): 250ms doubling to a 2s
+// cap, so a datasource restarting under load is not hammered.
+func retryBackoff(attempt int) time.Duration {
+	d := druidRetryBackoff << (attempt - 1)
+	if d <= 0 || d > druidRetryMaxBackoff {
+		return druidRetryMaxBackoff
+	}
+	return d
+}
+
+// sleepCtx waits d or ctx.Done, whichever comes first.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func parseDruidTime(v any) (time.Time, error) {
@@ -185,31 +314,6 @@ func asString(v any) string {
 		return x.String()
 	default:
 		return fmt.Sprint(x)
-	}
-}
-
-func asInt(v any, def int) int {
-	switch x := v.(type) {
-	case int:
-		return x
-	case int64:
-		return int(x)
-	case float64:
-		return int(x)
-	case json.Number:
-		i, err := x.Int64()
-		if err != nil {
-			return def
-		}
-		return int(i)
-	case string:
-		i, err := strconv.Atoi(strings.TrimSpace(x))
-		if err != nil {
-			return def
-		}
-		return i
-	default:
-		return def
 	}
 }
 

@@ -21,12 +21,17 @@ func main() {
 		slog.Error("config", "err", err)
 		os.Exit(1)
 	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: cfg.SlogLevel()})))
 	cal, err := forecast.CalendarByName(cfg.Calendar)
 	if err != nil {
 		slog.Error("calendar", "err", err)
 		os.Exit(1)
 	}
-	pub := baselines.NewPublisher(cfg, cal)
+	pub, err := baselines.NewPublisher(cfg, cal)
+	if err != nil {
+		slog.Error("publisher", "err", err)
+		os.Exit(1)
+	}
 	defer pub.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -36,6 +41,8 @@ func main() {
 		"interval", cfg.Interval.String(),
 		"aheadMinutes", cfg.AheadMinutes,
 		"shard", baselines.ShardID(cfg.ShardID),
+		"membership", pub.MembershipMode(),
+		"store", cfg.StoreDSN != "",
 		"shardPeers", cfg.ShardPeers,
 		"shardDNS", cfg.ShardDNS,
 	)
