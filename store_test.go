@@ -299,6 +299,12 @@ SELECT cron, timezone FROM forecast.retrain WHERE scope = 'baseline' AND key = $
 	if claims[0].Cron != "*/5 * * * *" || claims[0].Timezone != "UTC" {
 		t.Fatalf("claimed %+v, want the stored schedule", claims[0])
 	}
+	// The claim carries the row's org, which Done addresses the row by: the worker's
+	// own rows are the fleet-wide org 0.
+	orgID := claims[0].OrgID
+	if orgID != 0 {
+		t.Fatalf("claim org = %d, want the fleet-wide 0 the worker writes", orgID)
+	}
 	var claimedBy *string
 	if err := s.pool.QueryRow(ctx, `SELECT claimed_by FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&claimedBy); err != nil {
 		t.Fatal(err)
@@ -321,7 +327,7 @@ SELECT cron, timezone FROM forecast.retrain WHERE scope = 'baseline' AND key = $
 	// lease can expire mid-retrain and the row go to another worker, whose claim
 	// and next_run_at a stale finish would otherwise overwrite.
 	next := time.Now().UTC().Add(time.Hour).Truncate(time.Minute)
-	if err := s.Done(ctx, "someone-else", key, next, "error: stale"); err != nil {
+	if err := s.Done(ctx, "someone-else", orgID, key, next, "error: stale"); err != nil {
 		t.Fatal(err)
 	}
 	var (
@@ -345,7 +351,7 @@ FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&holder,
 		t.Fatalf("a non-holder wrote last_status=%v last_run_at=%v, want the row untouched", staleStat, lastRun)
 	}
 
-	if err := s.Done(ctx, "baselines-store-test", key, next, "ok"); err != nil {
+	if err := s.Done(ctx, "baselines-store-test", orgID, key, next, "ok"); err != nil {
 		t.Fatal(err)
 	}
 	var (
@@ -365,5 +371,20 @@ FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&status,
 	}
 	if claimedBy != nil {
 		t.Fatalf("claimed_by %v after finishing, want the claim released", claimedBy)
+	}
+
+	// A released claim is not an invitation. The owner predicate is the whole guard:
+	// once the holder has finished, an owner that lost its lease must still not write
+	// its own stale outcome over this row.
+	staleNext := next.Add(time.Hour)
+	if err := s.Done(ctx, "baselines-store-test", orgID, key, staleNext, "error: stale"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pool.QueryRow(ctx, `
+SELECT last_status, next_run_at FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&status, &storedAt); err != nil {
+		t.Fatal(err)
+	}
+	if status == nil || *status != "ok" || !storedAt.Equal(next) {
+		t.Fatalf("a released claim was written by a stale owner: status=%v next=%s", status, storedAt)
 	}
 }

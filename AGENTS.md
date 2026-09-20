@@ -25,7 +25,7 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - Source of truth is Druid SQL, not the metrics Kafka topic
 - Stay within v1/v2/v3 unless `docs/INTENTIONS.md` is updated first
 - Every Druid request is windowed and bounded (`DRUID_MAX_RANGE`, `DRUID_MAX_RPS`, `DRUID_MAX_INFLIGHT`, `DRUID_TIMEOUT`, `DRUID_RETRIES`); never re-introduce an unbounded `SELECT` or a `COUNT(*)` pre-size probe
-- Postgres holds snapshots, the retrain queue and the membership heartbeat. The worker creates only schema `baselines`; `forecast.retrain` is created and owned by `timeseries-grafana`, and this process only reads, claims and finishes rows in it
+- Postgres holds snapshots, the retrain queue and the membership heartbeat. The worker creates only schema `baselines`; `forecast.retrain` is created and owned by `timeseries-grafana`, and this process only reads, claims and finishes rows in it. Those rows are keyed `(scope, org_id, key)` and a `baseline` row lives at the fleet-wide `org_id = 0`; the claim carries that org so `Done` addresses the row by the full key, and the owner predicate is `claimed_by = self` with no `IS NULL` escape
 - The worker still exposes no HTTP surface
 - Fit in linear time; O(1) work per horizon step; pre-size series slices
 - Ownership is a pure, allocation-free function of `(metric_hash, peer set)`: a wrong peer set degrades to duplicate work or a stranded share, never to a crash or a stalled tick

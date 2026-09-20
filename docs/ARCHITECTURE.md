@@ -27,8 +27,8 @@ Each tick (immediate, then every `INTERVAL`):
 2. `Heartbeat` this worker into `baselines.workers` (best effort: an error keeps the previous peer set).
 3. Resolve the peer set (see Membership) and drop the hashes another worker owns.
 4. `Hashes(now - SCAN_RANGE, now)` — one Druid scan, sliced under `DRUID_MAX_RANGE` and cached for `HASH_SCAN_TTL`.
-5. Schedule: **one** `INSERT … SELECT … FROM unnest($1::text[]) ON CONFLICT (scope, key) DO NOTHING` inserts a row for every owned hash that has none (`scope='baseline'`, `DEFAULT_RETRAIN_CRON`, `timezone='UTC'`, due now). An existing row keeps its cron, timezone and `enabled`: the operator owns the schedule and a restart must not reset it.
-6. Retrain: `Claim(self, RETRAIN_RETRY, TRAIN_CONCURRENCY)` takes due `forecast.retrain` rows (**any** worker may retrain **any** hash, not only the ones it owns), then per claim: `Series(hash, now-LOOKBACK, now)` → `FitSeasonalBaseline` → `SnapshotOf` → `Put` into `baselines.snapshots` → `Done(self, key, next=nextRun(cron, tz, now), "ok")`. A failure writes `last_status='error: …'` and `next_run_at=now()+RETRAIN_RETRY`. `Done` only touches a row this worker still claims (`claimed_by IS NULL OR claimed_by = self`); a lease that expired mid-retrain reappears as zero rows affected, logs `claim lost` at debug, and is not an error.
+5. Schedule: **one** `INSERT … SELECT … FROM unnest($1::text[]) ON CONFLICT (scope, org_id, key) DO NOTHING` inserts a row for every owned hash that has none (`scope='baseline'`, `org_id=0`, `DEFAULT_RETRAIN_CRON`, `timezone='UTC'`, due now). An existing row keeps its cron, timezone and `enabled`: the operator owns the schedule and a restart must not reset it.
+6. Retrain: `Claim(self, RETRAIN_RETRY, TRAIN_CONCURRENCY)` takes due `forecast.retrain` rows (**any** worker may retrain **any** hash, not only the ones it owns), then per claim: `Series(hash, now-LOOKBACK, now)` → `FitSeasonalBaseline` → `SnapshotOf` → `Put` into `baselines.snapshots` → `Done(self, claim.OrgID, key, next=nextRun(cron, tz, now), "ok")`. A failure writes `last_status='error: …'` and `next_run_at=now()+RETRAIN_RETRY`. `Done` only touches a row this worker still claims (`claimed_by = self`, addressed by the full `(scope, org_id, key)`); a lease that expired mid-retrain appears as zero rows affected, logs `claim lost` at debug, and is not an error.
 7. Publish: for each owned hash whose snapshot is fresh (`SNAPSHOT_CACHE_TTL`, one `Fresh` query for all owned keys per tick, `Restore` only what moved), `ForecastRange(ts-1m, ts)` with `ts = now.Truncate(1m) + AHEAD_MINUTES`, and emit when `ts` is newer than the in-memory `published` mark and the value is not NaN. The one-minute lookback is deliberate: a grid that is not aligned to the wall-clock minute has no point exactly at `ts`, and asking for the exact point would return `ErrEmptyRange` on every tick; on an aligned grid the last point *is* `ts`.
 
 `metric_ts` is the wall-clock horizon, not the last observed timestamp, so a Druid outage or a stalled retrain cannot stop publishing as long as a snapshot exists. The clock is read once per tick, before the scan: a tick is one minute of wall clock however long its rate-limited scan and retrain take, so a slow tick still publishes the minute it started in instead of skipping it and colliding with the next tick (see Horizon clock). The metrics Kafka topic is not read; Druid is the source of truth for training. The Kafka key is `metric_hash|metric_ts`, so one point has one key: repeats land on the same partition and can be compacted away. Duplicate `(metric_hash, metric_ts)` pairs are also skipped in memory per process, but a restart or a membership change republishes: **consumers must treat the topic as upsert** and collapse duplicates instead of summing them (see Scaling and ingestion).
@@ -156,11 +156,11 @@ No host and no URL means persist off: `store == nil`, the schedule and heartbeat
 
 ## Retrain schedule
 
-`forecast.retrain` is created and owned by `timeseries-grafana` (Phase 4 of the plan); the worker only inserts `scope='baseline'` rows, claims them, and finishes them. One row per hash, `PRIMARY KEY (scope, key)`.
+`forecast.retrain` is created and owned by `timeseries-grafana` (Phase 4 of the plan); the worker only inserts `scope='baseline'` rows, claims them, and finishes them. One row per hash, `PRIMARY KEY (scope, org_id, key)` with the worker's rows at the fleet-wide `org_id = 0` (it has no notion of a Grafana org, and the plugin's panel rows are per-org, which is why the org is part of the key rather than a column).
 
 | Column | Worker use |
 | --- | --- |
-| `scope`, `key` | `'baseline'`, `metric_hash` |
+| `scope`, `org_id`, `key` | `'baseline'`, `0`, `metric_hash` |
 | `cron`, `timezone` | `DEFAULT_RETRAIN_CRON` (default `0 3 * * *`), `UTC` on insert; never reset by a later tick |
 | `enabled`, `spec` | Left alone. The plugin claims only `scope='panel'` rows with a spec; the worker claims only `scope='baseline'` rows |
 | `next_run_at` | Due when `<= now()`. Set to `nextRun(cron, tz, now)` on success and to `now + RETRAIN_RETRY` on failure |
@@ -172,35 +172,35 @@ The worker schedules its owned set with one statement per tick, not one per hash
 ```sql
 INSERT INTO forecast.retrain (scope, key, cron, timezone, enabled, next_run_at)
 SELECT 'baseline', k, $2, $3, true, now() FROM unnest($1::text[]) AS k
-ON CONFLICT (scope, key) DO NOTHING
+ON CONFLICT (scope, org_id, key) DO NOTHING
 ```
 
-`DO NOTHING` is what protects an operator's edit: once a row exists its `cron`, `timezone` and `enabled` are never touched again, however the fleet is restarted or rescaled.
+`DO NOTHING` is what protects an operator's edit: once a row exists its `cron`, `timezone` and `enabled` are never touched again, however the fleet is restarted or rescaled. It also means an admin may delete a row: a hash that still reports comes back on the next tick with the default cron, while a hash that stopped reporting stays gone — which is how a retired metric's row stops being retrained (and re-queried) forever.
 
 ```sql
 WITH due AS (
-  SELECT scope, key FROM forecast.retrain
+  SELECT scope, org_id, key FROM forecast.retrain
   WHERE scope = 'baseline' AND enabled AND next_run_at IS NOT NULL AND next_run_at <= now()
     AND (claimed_until IS NULL OR claimed_until < now())
   ORDER BY next_run_at LIMIT $2 FOR UPDATE SKIP LOCKED
 )
 UPDATE forecast.retrain r SET claimed_by = $1, claimed_until = now() + $3::interval
-FROM due WHERE r.scope = due.scope AND r.key = due.key
-RETURNING r.scope, r.key, r.cron, r.timezone
+FROM due WHERE r.scope = due.scope AND r.org_id = due.org_id AND r.key = due.key
+RETURNING r.org_id, r.key, r.cron, r.timezone
 ```
 
-`FOR UPDATE SKIP LOCKED` is what makes the claim fleet-wide and safe: two workers ticking at the same second both get rows, but never the same row, and neither blocks. The lease means a worker that dies mid-retrain releases the claim after `RETRAIN_RETRY` (default 5m) rather than stranding it. Because a claim is not tied to ownership, a hash owned by a stopped worker is still retrained on time, and the retrain cost is bounded by `TRAIN_CONCURRENCY` (default 2) per worker regardless of how many rows are due.
+`FOR UPDATE SKIP LOCKED` is what makes the claim fleet-wide and safe: two workers ticking at the same second both get rows, but never the same row, and neither blocks. The lease means a worker that dies mid-retrain releases the claim after `RETRAIN_RETRY` (default 5m) rather than stranding it. Because a claim is not tied to ownership, a hash owned by a stopped worker is still retrained on time, and the retrain cost is bounded by `TRAIN_CONCURRENCY` (default 2) per worker regardless of how many rows are due. The claim carries the row's `org_id`, which is how `Done` addresses the row by its full key.
 
 Releasing a claim is owner-guarded, because a retrain that outlived its lease has already been re-claimed by another worker:
 
 ```sql
 UPDATE forecast.retrain
-SET next_run_at = $3, last_run_at = now(), last_status = $4,
+SET next_run_at = $4, last_run_at = now(), last_status = $5,
     claimed_by = NULL, claimed_until = NULL
-WHERE scope = 'baseline' AND key = $1 AND (claimed_by IS NULL OR claimed_by = $2)
+WHERE scope = 'baseline' AND org_id = $3 AND key = $1 AND claimed_by = $2
 ```
 
-Zero rows affected means the claim was lost: the finish is dropped (debug log, no error) rather than overwriting the newer owner's `next_run_at`, `last_status` and claim. `claimed_by IS NULL` is accepted so a row released in the same statement's window still gets its schedule written.
+Zero rows affected means the claim was lost: the finish is dropped (debug log, no error) rather than overwriting the newer owner's `next_run_at`, `last_status` and claim. The owner predicate is the whole guard — there is deliberately no `claimed_by IS NULL` escape, which would let a stale worker write its own outcome over a row the newer owner had already finished and released.
 
 `nextRun` is `cron.ParseStandard(cron)` + `time.LoadLocation(tz)` + `Schedule.Next(now.In(loc)).UTC()`. `ParseStandard` is the 5-field form plus `@daily` / `@hourly` / `@every 1h` descriptors, and `Validate` refuses a `DEFAULT_RETRAIN_CRON` that does not parse at startup.
 
@@ -256,7 +256,7 @@ type snapshotStore interface {
 type retrainQueue interface {
 	Schedule(ctx context.Context, keys []string, cron, tz string) error
 	Claim(ctx context.Context, owner string, lease time.Duration, limit int) ([]retrainClaim, error)
-	Done(ctx context.Context, owner, key string, next time.Time, status string) error
+	Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string) error
 }
 
 type membership interface {

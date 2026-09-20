@@ -34,7 +34,7 @@ type snapshotStore interface {
 type retrainQueue interface {
 	Schedule(ctx context.Context, keys []string, cron, tz string) error
 	Claim(ctx context.Context, owner string, lease time.Duration, limit int) ([]retrainClaim, error)
-	Done(ctx context.Context, owner, key string, next time.Time, status string) error
+	Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string) error
 }
 
 // membership is the Postgres heartbeat that replaces static peer discovery on
@@ -63,8 +63,11 @@ type snapshotRecord struct {
 	TrainedAt time.Time
 }
 
-// retrainClaim is one due schedule row this worker now owns.
+// retrainClaim is one due schedule row this worker now owns. OrgID is carried so
+// Done can address the row by its full key: forecast.retrain is keyed
+// (scope, org_id, key), and the worker's own rows are the fleet-wide org 0.
 type retrainClaim struct {
+	OrgID    int64
 	Key      string
 	Cron     string
 	Timezone string

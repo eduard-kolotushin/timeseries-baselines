@@ -117,6 +117,7 @@ type putCall struct {
 
 type doneCall struct {
 	owner  string
+	orgID  int64
 	key    string
 	next   time.Time
 	status string
@@ -209,10 +210,10 @@ func (f *fakeBackend) Claim(_ context.Context, owner string, lease time.Duration
 	return f.due, nil
 }
 
-func (f *fakeBackend) Done(_ context.Context, owner, key string, next time.Time, status string) error {
+func (f *fakeBackend) Done(_ context.Context, owner string, orgID int64, key string, next time.Time, status string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.dones = append(f.dones, doneCall{owner: owner, key: key, next: next, status: status})
+	f.dones = append(f.dones, doneCall{owner: owner, orgID: orgID, key: key, next: next, status: status})
 	return nil
 }
 

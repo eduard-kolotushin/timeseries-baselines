@@ -267,20 +267,20 @@ func (p *Publisher) trainHash(ctx context.Context, c retrainClaim, now time.Time
 	if err == nil {
 		var next time.Time
 		if next, err = nextRun(c.Cron, c.Timezone, now); err == nil {
-			p.finish(ctx, c.Key, next, "ok")
+			p.finish(ctx, c, next, "ok")
 			return true
 		}
 	}
 	slog.Error("retrain", "metric_hash", c.Key, "err", err)
 	// A failure is due again after RETRAIN_RETRY rather than at the next cron
 	// fire: the row is broken now, and waiting until tomorrow hides it.
-	p.finish(ctx, c.Key, now.Add(p.cfg.RetrainRetry), "error: "+err.Error())
+	p.finish(ctx, c, now.Add(p.cfg.RetrainRetry), "error: "+err.Error())
 	return false
 }
 
-func (p *Publisher) finish(ctx context.Context, key string, next time.Time, status string) {
-	if err := p.store.Done(ctx, p.peers.self, key, next, status); err != nil {
-		slog.Error("retrain finish", "metric_hash", key, "err", err)
+func (p *Publisher) finish(ctx context.Context, c retrainClaim, next time.Time, status string) {
+	if err := p.store.Done(ctx, p.peers.self, c.OrgID, c.Key, next, status); err != nil {
+		slog.Error("retrain finish", "metric_hash", c.Key, "err", err)
 	}
 }
 

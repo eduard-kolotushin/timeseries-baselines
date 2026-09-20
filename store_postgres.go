@@ -241,7 +241,7 @@ func (s *postgresStore) Schedule(ctx context.Context, keys []string, cron, tz st
 	_, err := s.pool.Exec(ctx, `
 INSERT INTO forecast.retrain (scope, key, cron, timezone, enabled, next_run_at)
 SELECT 'baseline', k, $2, $3, true, now() FROM unnest($1::text[]) AS k
-ON CONFLICT (scope, key) DO NOTHING
+ON CONFLICT (scope, org_id, key) DO NOTHING
 `, keys, cron, tz)
 	return err
 }
@@ -255,7 +255,7 @@ func (s *postgresStore) Claim(ctx context.Context, owner string, lease time.Dura
 	}
 	rows, err := s.pool.Query(ctx, `
 WITH due AS (
-  SELECT scope, key FROM forecast.retrain
+  SELECT scope, org_id, key FROM forecast.retrain
   WHERE scope = 'baseline'
     AND enabled
     AND next_run_at IS NOT NULL
@@ -268,8 +268,8 @@ WITH due AS (
 UPDATE forecast.retrain r
 SET claimed_by = $2, claimed_until = now() + $3::interval
 FROM due
-WHERE r.scope = due.scope AND r.key = due.key
-RETURNING r.key, r.cron, r.timezone
+WHERE r.scope = due.scope AND r.org_id = due.org_id AND r.key = due.key
+RETURNING r.org_id, r.key, r.cron, r.timezone
 `, limit, owner, lease)
 	if err != nil {
 		return nil, err
@@ -278,7 +278,7 @@ RETURNING r.key, r.cron, r.timezone
 	out := make([]retrainClaim, 0, limit)
 	for rows.Next() {
 		var c retrainClaim
-		if err := rows.Scan(&c.Key, &c.Cron, &c.Timezone); err != nil {
+		if err := rows.Scan(&c.OrgID, &c.Key, &c.Cron, &c.Timezone); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -289,21 +289,22 @@ RETURNING r.key, r.cron, r.timezone
 // Done releases the claim and sets when the row is next due. A failure passes
 // now+RETRAIN_RETRY as next, so a broken hash is retried instead of being lost.
 //
-// Only the owner of the claim may finish it: a retrain that outlives its lease
-// has already been handed to another worker by the time it returns, and a stale
-// finisher would overwrite that worker's claim and next_run_at. Zero rows
-// affected therefore means the claim was lost, which is not an error.
-func (s *postgresStore) Done(ctx context.Context, owner, key string, next time.Time, status string) error {
+// Only the owner of the claim may finish it: a retrain that outlives its lease has
+// already been handed to another worker by the time it returns, and a stale
+// finisher would overwrite that worker's next run and status — including after that
+// worker has released the claim itself, which is why the owner predicate is the
+// whole guard and a NULL claim is not a licence to write. Zero rows affected
+// therefore means the claim was lost, which is not an error.
+func (s *postgresStore) Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string) error {
 	if err := s.ensure(ctx); err != nil {
 		return err
 	}
 	tag, err := s.pool.Exec(ctx, `
 UPDATE forecast.retrain
-SET next_run_at = $3, last_run_at = now(), last_status = $4,
+SET next_run_at = $4, last_run_at = now(), last_status = $5,
     claimed_by = NULL, claimed_until = NULL
-WHERE scope = 'baseline' AND key = $1
-  AND (claimed_by IS NULL OR claimed_by = $2)
-`, key, owner, next, status)
+WHERE scope = 'baseline' AND org_id = $3 AND key = $1 AND claimed_by = $2
+`, key, owner, orgID, next, status)
 	if err != nil {
 		return err
 	}
