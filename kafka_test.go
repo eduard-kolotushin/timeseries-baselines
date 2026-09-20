@@ -3,7 +3,22 @@ package baselines
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/segmentio/kafka-go"
 )
+
+// The sink builds its writer with a literal, and kafka-go only turns RequiredAcks 0
+// into RequireAll inside NewWriter: at 0 the client's Produce returns (nil, nil), so
+// a broker-rejected record would be counted as published. Pin the setting the
+// publisher's error handling depends on.
+func TestKafkaSinkRequiresAllAcks(t *testing.T) {
+	t.Parallel()
+	sink := newKafkaSink([]string{"127.0.0.1:9092"}, "baselines")
+	t.Cleanup(func() { _ = sink.Close() })
+	if sink.w.RequiredAcks != kafka.RequireAll {
+		t.Fatalf("RequiredAcks=%d, want RequireAll(%d)", sink.w.RequiredAcks, kafka.RequireAll)
+	}
+}
 
 func TestMessageKeyIsUniquePerPoint(t *testing.T) {
 	t.Parallel()

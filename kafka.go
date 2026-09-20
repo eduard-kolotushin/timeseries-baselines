@@ -27,9 +27,14 @@ type kafkaSink struct {
 func newKafkaSink(brokers []string, topic string) *kafkaSink {
 	return &kafkaSink{
 		w: &kafka.Writer{
-			Addr:                   kafka.TCP(brokers...),
-			Topic:                  topic,
-			Balancer:               &kafka.Hash{},
+			Addr:     kafka.TCP(brokers...),
+			Topic:    topic,
+			Balancer: &kafka.Hash{},
+			// A literal Writer is not kafka.NewWriter, which is the only place
+			// kafka-go turns a 0 into RequireAll. Left at 0, RequiredAcks is
+			// RequireNone, and the client's Produce returns (nil, nil) for it: a
+			// record the broker rejects would be counted as published.
+			RequiredAcks:           kafka.RequireAll,
 			AllowAutoTopicCreation: true,
 		},
 	}

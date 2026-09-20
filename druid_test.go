@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -479,5 +480,145 @@ func TestWindows(t *testing.T) {
 				t.Fatalf("the last window ends at %s, want %s", last, tc.to)
 			}
 		})
+	}
+}
+
+// testDruidStore builds a store against a fake Druid that serves rows from reply.
+func testDruidStore(t *testing.T, reply func(t *testing.T, attempt int, query string) (any, int), cfg Config) (*druidStore, *druidServer) {
+	t.Helper()
+	srv := newDruidServer(t, reply)
+	cfg.DruidBroker = srv.URL
+	if cfg.DruidDatasource == "" {
+		cfg.DruidDatasource = "metrics"
+	}
+	return newDruidStore(cfg, srv.Client()), srv
+}
+
+// A reply over the cap is refused instead of buffered whole, and refused without a
+// retry: the same query returns the same oversized body.
+func TestDruidSeriesRejectsAnOversizedReply(t *testing.T) {
+	t.Parallel()
+	to := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	store, srv := testDruidStore(t, func(t *testing.T, _ int, query string) (any, int) {
+		lo, hi := queryWindow(t, query)
+		return minuteRows(lo.UnixMilli(), hi.UnixMilli()), http.StatusOK
+	}, Config{DruidRetries: 3})
+	store.maxReply = 64
+
+	_, err := store.Series(context.Background(), "ready", to.Add(-time.Hour), to)
+	if err == nil || !strings.Contains(err.Error(), "exceeds 64 bytes") {
+		t.Fatalf("err=%v, want an oversized-reply error", err)
+	}
+	if got := len(srv.sqlQueries()); got != 1 {
+		t.Fatalf("an oversized reply was requested %d times, want 1", got)
+	}
+}
+
+// A null or unparseable value is a missing point, not a zero: it keeps its timestamp,
+// because the 1-minute check runs on this series before the fit drops NaN, and its
+// value is NaN, which the fit ignores instead of fitting a fabricated zero.
+func TestDruidSeriesKeepsMissingValuesAsNaN(t *testing.T) {
+	t.Parallel()
+	to := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	from := to.Add(-3 * time.Minute)
+	store, _ := testDruidStore(t, func(t *testing.T, _ int, query string) (any, int) {
+		lo, _ := queryWindow(t, query)
+		return []map[string]any{
+			{"__time": lo.Format(time.RFC3339), "metric_value": 1.5},
+			{"__time": lo.Add(time.Minute).Format(time.RFC3339), "metric_value": nil},
+			{"__time": lo.Add(2 * time.Minute).Format(time.RFC3339), "metric_value": "not-a-number"},
+		}, http.StatusOK
+	}, Config{})
+
+	s, err := store.Series(context.Background(), "ready", from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Len() != 3 {
+		t.Fatalf("series has %d points, want 3", s.Len())
+	}
+	first, err := s.Value(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1.5 {
+		t.Fatalf("first value %v, want 1.5", first)
+	}
+	for i := 1; i < s.Len(); i++ {
+		v, err := s.Value(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !math.IsNaN(v) {
+			t.Fatalf("value %d is %v, want NaN", i, v)
+		}
+	}
+	prev, err := s.Time(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := s.Time(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step := next.Sub(prev); step != time.Minute {
+		t.Fatalf("step across a missing value is %s, want 1m", step)
+	}
+}
+
+// A row whose timestamp cannot be read is dropped so the rest of the window stays
+// usable, and the drop is counted rather than silent.
+func TestDruidSeriesSkipsRowsItCannotPlaceInTime(t *testing.T) {
+	t.Parallel()
+	to := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	from := to.Add(-2 * time.Minute)
+	store, _ := testDruidStore(t, func(t *testing.T, _ int, query string) (any, int) {
+		lo, _ := queryWindow(t, query)
+		return []map[string]any{
+			{"__time": lo.Format(time.RFC3339), "metric_value": 1.0},
+			{"__time": "not-a-time", "metric_value": 2.0},
+			{"__time": lo.Add(time.Minute).Format(time.RFC3339), "metric_value": 3.0},
+		}, http.StatusOK
+	}, Config{})
+
+	s, err := store.Series(context.Background(), "ready", from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Len() != 2 {
+		t.Fatalf("series has %d points, want the two readable rows", s.Len())
+	}
+	second, err := s.Value(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != 3.0 {
+		t.Fatalf("value %d is %v, want 3", 1, second)
+	}
+}
+
+// The scan drops a grouped row it cannot read the same way, keeping the hashes it can.
+func TestDruidHashesSkipsUnusableRows(t *testing.T) {
+	t.Parallel()
+	to := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	from := to.Add(-time.Hour)
+	store, _ := testDruidStore(t, func(t *testing.T, _ int, query string) (any, int) {
+		lo, hi := queryWindow(t, query)
+		return []map[string]any{
+			{"metric_hash": "ready", "tmin": lo.Format(time.RFC3339), "tmax": hi.Add(-time.Minute).Format(time.RFC3339)},
+			{"metric_hash": nil, "tmin": lo.Format(time.RFC3339), "tmax": hi.Format(time.RFC3339)},
+			{"metric_hash": "broken", "tmin": lo.Format(time.RFC3339), "tmax": "not-a-time"},
+		}, http.StatusOK
+	}, Config{})
+
+	spans, err := store.Hashes(context.Background(), from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spans) != 1 || spans[0].Hash != "ready" {
+		t.Fatalf("spans=%+v, want only the readable hash", spans)
+	}
+	if !spans[0].Min.Equal(from) || !spans[0].Max.Equal(to.Add(-time.Minute)) {
+		t.Fatalf("span [%s, %s], want [%s, %s]", spans[0].Min, spans[0].Max, from, to.Add(-time.Minute))
 	}
 }

@@ -24,7 +24,9 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - Public ops do not mutate caller series
 - Source of truth is Druid SQL, not the metrics Kafka topic
 - Stay within v1/v2/v3 unless `docs/INTENTIONS.md` is updated first
-- Every Druid request is windowed and bounded (`DRUID_MAX_RANGE`, `DRUID_MAX_RPS`, `DRUID_MAX_INFLIGHT`, `DRUID_TIMEOUT`, `DRUID_RETRIES`); never re-introduce an unbounded `SELECT` or a `COUNT(*)` pre-size probe
+- Every Druid request is windowed and bounded (`DRUID_MAX_RANGE`, `DRUID_MAX_RPS`, `DRUID_MAX_INFLIGHT`, `DRUID_TIMEOUT`, `DRUID_RETRIES`) and one reply is capped at 64 MiB; never re-introduce an unbounded `SELECT`, a `COUNT(*)` pre-size probe or an unbounded `io.ReadAll`
+- A column the worker cannot read is never a zero: a null or unparseable `metric_value` is `NaN` and keeps its timestamp (the 1-minute check runs before the fit drops NaN), and a row it cannot place in time is dropped with a warning
+- The Kafka sink writes with `RequiredAcks: RequireAll`; a literal `kafka.Writer` would default to `RequireNone`, whose `Produce` returns `(nil, nil)`, making a broker-rejected record look published
 - Postgres holds snapshots, the retrain queue and the membership heartbeat. The worker creates only schema `baselines`; `forecast.retrain` is created and owned by `timeseries-grafana`, and this process only reads, claims and finishes rows in it. Those rows are keyed `(scope, org_id, key)` and a `baseline` row lives at the fleet-wide `org_id = 0`; the claim carries that org so `Done` addresses the row by the full key, and the owner predicate is `claimed_by = self` with no `IS NULL` escape
 - The worker still exposes no HTTP surface
 - Fit in linear time; O(1) work per horizon step; pre-size series slices

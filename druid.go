@@ -19,6 +19,12 @@ import (
 const (
 	druidRetryBackoff    = 250 * time.Millisecond
 	druidRetryMaxBackoff = 2 * time.Second
+
+	// maxDruidReplyBytes caps one Druid SQL reply. A series window holds at most
+	// one row per minute and the scan is aggregate-only, so a legitimate reply is
+	// orders of magnitude smaller than this; the cap is what keeps a broken or
+	// hostile datasource from pulling the process out of memory.
+	maxDruidReplyBytes = 64 << 20
 )
 
 type metricSpan struct {
@@ -40,6 +46,7 @@ type druidStore struct {
 	datasource string
 	client     *http.Client
 	maxRange   time.Duration
+	maxReply   int64
 	retries    int
 	authHeader string
 	authValue  string
@@ -57,6 +64,7 @@ func newDruidStore(cfg Config, client *http.Client) *druidStore {
 		datasource: cfg.DruidDatasource,
 		client:     client,
 		maxRange:   cfg.DruidMaxRange,
+		maxReply:   maxDruidReplyBytes,
 		retries:    cfg.DruidRetries,
 		authHeader: cfg.DruidAuthHeader,
 		authValue:  cfg.DruidAuthValue,
@@ -107,13 +115,27 @@ func (d *druidStore) Series(ctx context.Context, hash string, from, to time.Time
 		n := int(hi.Sub(lo)/time.Minute) + 1
 		times := make([]time.Time, 0, n)
 		values := make([]float64, 0, n)
+		skipped, missing := 0, 0
 		for _, row := range rows {
 			t, err := parseDruidTime(row["__time"])
 			if err != nil {
+				// A row we cannot place in time is data we do not have: dropping it
+				// keeps the rest of the window usable, but it is not silent.
+				skipped++
 				continue
 			}
+			v := asFloat(row["metric_value"])
+			if math.IsNaN(v) {
+				missing++
+			}
+			// The timestamp is kept even when the value is missing: the 1-minute
+			// grid is checked on this series before the fit drops NaN, so dropping
+			// the point instead would make a gapped series look like a bad step.
 			times = append(times, t)
-			values = append(values, asFloat(row["metric_value"]))
+			values = append(values, v)
+		}
+		if skipped > 0 || missing > 0 {
+			slog.Warn("druid series rows unusable", "hash", hash, "skipped", skipped, "missing", missing, "window", lo)
 		}
 		part, err := timeseries.New(times, values)
 		if err != nil {
@@ -143,17 +165,21 @@ func (d *druidStore) Hashes(ctx context.Context, from, to time.Time) ([]metricSp
 		if err != nil {
 			return nil, err
 		}
+		skipped := 0
 		for _, row := range rows {
 			hash := asString(row["metric_hash"])
 			if hash == "" {
+				skipped++
 				continue
 			}
 			minT, err := parseDruidTime(row["tmin"])
 			if err != nil {
+				skipped++
 				continue
 			}
 			maxT, err := parseDruidTime(row["tmax"])
 			if err != nil {
+				skipped++
 				continue
 			}
 			i, ok := index[hash]
@@ -168,6 +194,9 @@ func (d *druidStore) Hashes(ctx context.Context, from, to time.Time) ([]metricSp
 			if maxT.After(out[i].Max) {
 				out[i].Max = maxT
 			}
+		}
+		if skipped > 0 {
+			slog.Warn("druid hash rows unusable", "skipped", skipped, "window", lo)
 		}
 	}
 	return out, nil
@@ -225,9 +254,14 @@ func (d *druidStore) do(ctx context.Context, op string, body []byte, from, to ti
 		return nil, true, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, d.maxReply+1))
 	if err != nil {
 		return nil, true, err
+	}
+	if int64(len(raw)) > d.maxReply {
+		// Not retryable: the same query returns the same oversized body, so a
+		// retry only multiplies the read.
+		return nil, false, fmt.Errorf("druid sql reply exceeds %d bytes", d.maxReply)
 	}
 	if resp.StatusCode >= 500 {
 		return nil, true, fmt.Errorf("druid sql: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
@@ -317,6 +351,9 @@ func asString(v any) string {
 	}
 }
 
+// asFloat reads a numeric column. A null, an unparseable string or an unknown
+// type is math.NaN() — the library's missing-value marker, which the fit drops —
+// never 0, which would be a fabricated data point in the middle of a series.
 func asFloat(v any) float64 {
 	switch x := v.(type) {
 	case float64:
@@ -326,12 +363,18 @@ func asFloat(v any) float64 {
 	case int64:
 		return float64(x)
 	case json.Number:
-		f, _ := x.Float64()
+		f, err := x.Float64()
+		if err != nil {
+			return math.NaN()
+		}
 		return f
 	case string:
-		f, _ := strconv.ParseFloat(x, 64)
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return math.NaN()
+		}
 		return f
 	default:
-		return 0
+		return math.NaN()
 	}
 }
