@@ -26,10 +26,15 @@ type snapshotStore interface {
 // retrainQueue distributes scheduled retrains. Claims are fleet-wide and not
 // restricted to a worker's own hashes, so a schedule runs even when the hash's
 // rendezvous owner is down.
+//
+// Schedule takes the whole owned set at once: one statement per tick instead of
+// one round trip per hash. Done carries the owner of the claim it finishes,
+// because a lease that expired mid-retrain can hand the row to another worker,
+// whose schedule a stale finish must not overwrite.
 type retrainQueue interface {
-	Schedule(ctx context.Context, key, cron, tz string) error
+	Schedule(ctx context.Context, keys []string, cron, tz string) error
 	Claim(ctx context.Context, owner string, lease time.Duration, limit int) ([]retrainClaim, error)
-	Done(ctx context.Context, key string, next time.Time, status string) error
+	Done(ctx context.Context, owner, key string, next time.Time, status string) error
 }
 
 // membership is the Postgres heartbeat that replaces static peer discovery on

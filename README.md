@@ -32,7 +32,7 @@ Workers share the table by rendezvous hashing of `metric_hash`, so two workers w
 
 `SHARD_MEMBERSHIP` (`auto` by default) picks the source: `auto` takes `SHARD_PEERS`, then `SHARD_DNS`, then the store heartbeat, then this worker alone; `peers` / `dns` / `store` force one source. With `store`, each worker upserts `baselines.workers` every tick and the peer set is the ids seen within `WORKER_TTL` (default `max(30s, 2*INTERVAL)`, and always longer than `INTERVAL`), so a **VM fleet needs one shared Postgres and no DNS or peer list at all**, and a stopped worker ages out on its own — its share moves to the survivors rather than staying stranded.
 
-`SHARD_ID` must be unique per running worker. It defaults to the first non-loopback IP, which is unique for containers, pods, and separate VMs — but two processes on **one host** would both be that same peer: they would publish the same share twice and strand the other peers' hashes. Give co-located workers explicit `SHARD_ID` values or use `SHARD_PEERS`.
+`SHARD_ID` must be unique per running worker. It defaults to the first non-loopback IP, which is unique for containers, pods, and separate VMs — but two processes on **one host** would both be that same peer: one share is published by both of them (measured on 2048 hashes: 985 published twice, none stranded, so ingestion absorbs it), and the fleet covers one identity fewer hashes than it has processes. Give co-located workers explicit `SHARD_ID` values or use `SHARD_PEERS`.
 
 Empty peer settings mean one worker owns every hash. Setting both `SHARD_PEERS` and `SHARD_DNS` is an error. A failed lookup keeps the last good peer set, and a static list must match the running workers exactly: a listed peer that is not running strands its share.
 

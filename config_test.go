@@ -217,7 +217,13 @@ func TestConfigValidate(t *testing.T) {
 			c.ScanRange = 24 * time.Hour
 		}, "SCAN_RANGE"},
 		{"scan range equal to lookback", func(c *Config) {
+			// The half-open scan clamps a hash's Min to the window start and
+			// excludes now, so a window of exactly LOOKBACK makes every hash look
+			// shorter than LOOKBACK and the worker publishes nothing.
 			c.ScanRange = c.Lookback
+		}, "SCAN_RANGE"},
+		{"scan range with two intervals of slack", func(c *Config) {
+			c.ScanRange = c.Lookback + 2*c.Interval
 		}, ""},
 		{"train concurrency", func(c *Config) { c.TrainConcurrency = 0 }, "TRAIN_CONCURRENCY"},
 		{"worker ttl", func(c *Config) { c.WorkerTTL = 500 * time.Millisecond }, "WORKER_TTL"},

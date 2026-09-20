@@ -25,6 +25,11 @@ type Publisher struct {
 	store     storeBackend
 	trainSem  *semaphore
 
+	// now is the tick's clock. One tick reads it once, so a slow retrain cannot
+	// move the publish horizon past the minute the tick belongs to: a tick is
+	// one minute of wall clock, however long its work takes.
+	now func() time.Time
+
 	// One metric_hash scan per HashScanTTL: the hash set moves on the order of
 	// hours, so paying a GROUP BY per worker per minute buys nothing.
 	scanAt    time.Time
@@ -36,6 +41,9 @@ type Publisher struct {
 	// must not restore one per tick.
 	freshAt time.Time
 	fitted  map[string]snapshotFit
+	// ownedSet is the owned key set of the current tick, reused so pruning the
+	// fit cache does not allocate a map per tick.
+	ownedSet map[string]struct{}
 	// warned is the last condition logged per hash, so a hash that is scheduled
 	// but not yet trained does not log on every tick.
 	warned map[string]string
@@ -71,6 +79,7 @@ func newPublisher(cfg Config, src metricReader, sink baselineSink, cal *forecast
 		published: make(map[string]int64),
 		peers:     newPeerSource(cfg, store),
 		trainSem:  newSemaphore(cfg.TrainConcurrency),
+		now:       time.Now,
 		fitted:    make(map[string]snapshotFit),
 		warned:    make(map[string]string),
 	}
@@ -136,11 +145,15 @@ func (p *Publisher) tick(ctx context.Context) {
 // The heartbeat carries this tick's owned count, which is only known after the
 // scan, so it is written once the scan is in — still one row write per tick, and
 // a peer always includes itself, so nobody waits for their own row to appear.
+//
+// The tick reads the clock once and hands it to every step that stamps a time,
+// so a retrain that runs across a minute boundary still publishes the minute the
+// tick started in.
 func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 	if err := ctx.Err(); err != nil {
 		return tickResult{}, false
 	}
-	now := time.Now().UTC()
+	now := p.now().UTC()
 	peers := p.peers.peers(ctx)
 	spans, err := p.scan(ctx, now)
 	if err != nil {
@@ -151,7 +164,7 @@ func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 	p.heartbeat(ctx, len(keys), len(peers))
 	res := tickResult{peers: len(peers), owned: len(keys), skipped: len(spans) - len(keys)}
 	res.retrained = p.retrain(ctx, keys)
-	res.published = p.emit(ctx, spans, keys, peers)
+	res.published = p.emit(ctx, spans, keys, peers, now)
 	return res, true
 }
 
@@ -202,13 +215,13 @@ func (p *Publisher) retrain(ctx context.Context, keys []string) int {
 	if p.store == nil {
 		return 0
 	}
-	for _, key := range keys {
-		if err := p.store.Schedule(ctx, key, p.cfg.DefaultRetrainCron, "UTC"); err != nil {
-			// Almost always systemic (table missing, database down), so one
-			// error per tick is enough detail.
-			slog.Error("schedule", "metric_hash", key, "err", err)
-			break
-		}
+	// One statement for the whole owned set: a row per hash exists after the
+	// first tick, so the other 1439 ticks a day would pay an INSERT each for
+	// nothing.
+	if err := p.store.Schedule(ctx, keys, p.cfg.DefaultRetrainCron, "UTC"); err != nil {
+		// Almost always systemic (table missing, database down), so one error
+		// per tick is enough detail.
+		slog.Error("schedule", "hashes", len(keys), "err", err)
 	}
 	claims, err := p.store.Claim(ctx, p.peers.self, p.cfg.RetrainRetry, p.cfg.TrainConcurrency)
 	if err != nil {
@@ -218,7 +231,7 @@ func (p *Publisher) retrain(ctx context.Context, keys []string) int {
 	if len(claims) == 0 {
 		return 0
 	}
-	now := time.Now().UTC()
+	now := p.now().UTC()
 	var (
 		wg    sync.WaitGroup
 		mu    sync.Mutex
@@ -246,7 +259,9 @@ func (p *Publisher) retrain(ctx context.Context, keys []string) int {
 	return train
 }
 
-// trainHash refits one hash and stores the snapshot.
+// trainHash refits one hash and stores the snapshot. The finish carries the
+// owner of the claim: a lease that expired while this retrain ran has already
+// been re-claimed, and that worker's row must not be overwritten from here.
 func (p *Publisher) trainHash(ctx context.Context, c retrainClaim, now time.Time) bool {
 	err := p.fitHash(ctx, c.Key, now)
 	if err == nil {
@@ -264,7 +279,7 @@ func (p *Publisher) trainHash(ctx context.Context, c retrainClaim, now time.Time
 }
 
 func (p *Publisher) finish(ctx context.Context, key string, next time.Time, status string) {
-	if err := p.store.Done(ctx, key, next, status); err != nil {
+	if err := p.store.Done(ctx, p.peers.self, key, next, status); err != nil {
 		slog.Error("retrain finish", "metric_hash", key, "err", err)
 	}
 }
@@ -301,10 +316,13 @@ func (p *Publisher) fitHash(ctx context.Context, key string, now time.Time) erro
 }
 
 // emit publishes one point per owned hash and reports how many another worker
-// owns, so a single tick line describes the whole fleet.
-func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string, peers []string) int {
+// owns, so a single tick line describes the whole fleet. now is the tick's own
+// start, not the moment the retrain happened to finish: the horizon this tick
+// owes is now.Truncate(1m) + AHEAD_MINUTES, and a retrain that runs across a
+// minute boundary must publish that minute, not skip it.
+func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string, peers []string, now time.Time) int {
 	p.refreshSnapshots(ctx, keys)
-	ts := time.Now().UTC().Truncate(time.Minute).Add(time.Duration(p.cfg.AheadMinutes) * time.Minute)
+	ts := now.Truncate(time.Minute).Add(time.Duration(p.cfg.AheadMinutes) * time.Minute)
 	published := 0
 	for _, span := range spans {
 		if err := ctx.Err(); err != nil {
@@ -372,7 +390,7 @@ func (p *Publisher) fitForecast(ctx context.Context, span metricSpan) bool {
 	if span.Max.Sub(span.Min) < p.cfg.Lookback {
 		return false
 	}
-	s, err := p.src.Series(ctx, span.Hash, span.Max.Add(-p.cfg.Lookback), time.Now().UTC())
+	s, err := p.src.Series(ctx, span.Hash, span.Max.Add(-p.cfg.Lookback), p.now().UTC())
 	if err != nil {
 		slog.Error("metric", "metric_hash", span.Hash, "err", err)
 		return false
@@ -423,11 +441,19 @@ func (p *Publisher) publish(ctx context.Context, key string, at time.Time, value
 // most per SnapshotCacheTTL, and only for the snapshots whose updated_at moved.
 // A failed freshness query keeps the cached fits: publishing must survive a
 // store hiccup, because the models it needs are already in memory.
+//
+// Every call also drops the fits this worker no longer owns, before the cache
+// TTL can short-circuit the query: a hash that moved to another peer would
+// otherwise keep ~0.5 MB of fitted state on this process for its whole life.
 func (p *Publisher) refreshSnapshots(ctx context.Context, keys []string) {
-	if p.store == nil || len(keys) == 0 {
+	if p.store == nil {
 		return
 	}
-	now := time.Now().UTC()
+	p.pruneFits(keys)
+	if len(keys) == 0 {
+		return
+	}
+	now := p.now().UTC()
 	if !p.freshAt.IsZero() && now.Sub(p.freshAt) < p.cfg.SnapshotCacheTTL {
 		return
 	}
@@ -461,6 +487,29 @@ func (p *Publisher) refreshSnapshots(ctx context.Context, keys []string) {
 			continue
 		}
 		p.fitted[key] = snapshotFit{updatedAt: updated, fitted: fitted}
+		delete(p.warned, key)
+	}
+}
+
+// pruneFits drops the fits and warning state of every hash this worker no longer
+// owns, so a hash that moved to another peer releases its fitted state instead of
+// pinning it for the life of the process.
+func (p *Publisher) pruneFits(keys []string) {
+	if len(p.fitted) == 0 {
+		return
+	}
+	if p.ownedSet == nil {
+		p.ownedSet = make(map[string]struct{}, len(keys))
+	}
+	clear(p.ownedSet)
+	for _, key := range keys {
+		p.ownedSet[key] = struct{}{}
+	}
+	for key := range p.fitted {
+		if _, ok := p.ownedSet[key]; ok {
+			continue
+		}
+		delete(p.fitted, key)
 		delete(p.warned, key)
 	}
 }

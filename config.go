@@ -218,11 +218,15 @@ func (c Config) Validate() error {
 	if c.DruidMaxRPS < 0 {
 		return fmt.Errorf("DRUID_MAX_RPS must not be negative")
 	}
-	if c.ScanRange > 0 && c.ScanRange < c.Lookback {
-		// A scan window shorter than LOOKBACK hides hashes that are still
-		// trainable, because the bounded scan clamps a hash's Min to the window
-		// start and such a hash then looks ineligible.
-		return fmt.Errorf("SCAN_RANGE must be at least LOOKBACK")
+	if c.ScanRange > 0 && c.ScanRange < c.Lookback+2*c.Interval {
+		// The scan is half-open and bounded, so a hash's reported Min is clamped
+		// to the window start and its Max is the last sighting strictly before
+		// now: even a hash reporting every minute looks at most SCAN_RANGE-1m
+		// long, and SCAN_RANGE == LOOKBACK would fail the LOOKBACK eligibility
+		// test for every hash. Two intervals of slack keep a live series
+		// eligible across a tick that started just after the window opened.
+		return fmt.Errorf("SCAN_RANGE must be at least LOOKBACK + 2*INTERVAL (%s), because the bounded scan clamps Min to the window start and excludes now, so a shorter window makes every hash look ineligible",
+			c.Lookback+2*c.Interval)
 	}
 	if c.TrainConcurrency < 1 {
 		return fmt.Errorf("TRAIN_CONCURRENCY must be at least 1")

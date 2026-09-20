@@ -239,18 +239,22 @@ func TestPostgresRetrainQueue(t *testing.T) {
 	if table == nil {
 		t.Skip("forecast.retrain does not exist: the plugin has not run against this database")
 	}
-	const key = "baselines-store-test"
+	const (
+		key    = "baselines-store-test"
+		second = "baselines-store-test-2"
+	)
 	cleanup := func() {
-		_, _ = s.pool.Exec(context.Background(), `DELETE FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key)
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM forecast.retrain WHERE scope = 'baseline' AND key IN ($1, $2)`, key, second)
 	}
 	cleanup()
 	t.Cleanup(cleanup)
 
-	if err := s.Schedule(ctx, key, "*/5 * * * *", "UTC"); err != nil {
+	// One statement schedules the whole owned set: the second insert must add the
+	// new key without resetting the row that is already there.
+	if err := s.Schedule(ctx, []string{key}, "*/5 * * * *", "UTC"); err != nil {
 		t.Fatal(err)
 	}
-	// A worker restart must not reset a schedule the operator has changed.
-	if err := s.Schedule(ctx, key, "0 3 * * *", "Europe/Moscow"); err != nil {
+	if err := s.Schedule(ctx, []string{key, second}, "0 3 * * *", "Europe/Moscow"); err != nil {
 		t.Fatal(err)
 	}
 	var (
@@ -269,6 +273,16 @@ FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&cron, &
 	}
 	if !enabled || !nextRunNotNull || !nextRunDue {
 		t.Fatalf("new row enabled=%v next_run_at set=%v due=%v, want an enabled, immediately due schedule", enabled, nextRunNotNull, nextRunDue)
+	}
+	if err := s.pool.QueryRow(ctx, `
+SELECT cron, timezone FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, second).Scan(&cron, &tz); err != nil {
+		t.Fatal(err)
+	}
+	if cron != "0 3 * * *" || tz != "Europe/Moscow" {
+		t.Fatalf("the batched schedule wrote cron=%q tz=%q for the new key, want the statement's values", cron, tz)
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, second); err != nil {
+		t.Fatal(err)
 	}
 
 	// Move the row to the front of the queue so a small claim cannot miss it.
@@ -303,8 +317,35 @@ FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&cron, &
 		}
 	}
 
+	// A finisher that no longer holds the claim must leave the row alone: its
+	// lease can expire mid-retrain and the row go to another worker, whose claim
+	// and next_run_at a stale finish would otherwise overwrite.
 	next := time.Now().UTC().Add(time.Hour).Truncate(time.Minute)
-	if err := s.Done(ctx, key, next, "ok"); err != nil {
+	if err := s.Done(ctx, "someone-else", key, next, "error: stale"); err != nil {
+		t.Fatal(err)
+	}
+	var (
+		holder    *string
+		dueAt     time.Time
+		lastRun   *time.Time
+		staleStat *string
+	)
+	if err := s.pool.QueryRow(ctx, `
+SELECT claimed_by, next_run_at, last_run_at, last_status
+FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&holder, &dueAt, &lastRun, &staleStat); err != nil {
+		t.Fatal(err)
+	}
+	if holder == nil || *holder != "baselines-store-test" {
+		t.Fatalf("a non-holder released the claim: claimed_by %v", holder)
+	}
+	if dueAt.After(time.Now().UTC()) {
+		t.Fatalf("a non-holder moved next_run_at to %s, want the claimed row's due time", dueAt)
+	}
+	if staleStat != nil || lastRun != nil {
+		t.Fatalf("a non-holder wrote last_status=%v last_run_at=%v, want the row untouched", staleStat, lastRun)
+	}
+
+	if err := s.Done(ctx, "baselines-store-test", key, next, "ok"); err != nil {
 		t.Fatal(err)
 	}
 	var (

@@ -28,7 +28,9 @@ Behaviour described here: worker `052c1a8`, chart value `baselines.replicas`.
 | Work is split, not duplicated | Two or more workers publish pairwise **disjoint** hash sets that together cover every ready hash |
 | Ownership needs no coordinator | Workers never talk to each other; the only shared systems are Druid (work source) and Kafka (output) |
 | Scaling moves little | Adding/removing one worker moves about `1/N` of the hashes; the rest keep their owner |
-| A scale event loses at most one tick | The new owner publishes its own `last + AHEAD_MINUTES` on its next tick; no backfill |
+| A scale event loses at most one tick | The new owner publishes its own wall-clock horizon on its next tick; no backfill |
+| A retrain never skips a minute | The tick's horizon comes from the clock it read at its start, so a scan and a sliced retrain that run past the minute still publish it |
+| A slow Druid cannot stop publishing | With `BASELINE_STORE_*` set the publish path reads only the snapshot cache: zero Druid requests and no `Series` call in steady state |
 | Duplicates cannot corrupt values | Ingestion collapses a repeated `(metric_hash, metric_ts)` (`doubleMax` with minute rollup), and the dashboard reads `MAX(baseline_value)` |
 | A wrong peer list degrades visibly | A static list with a peer that is not running strands that peer's share (negative control, VM) |
 
@@ -37,18 +39,33 @@ flowchart LR
   subgraph druid["Druid (source of truth)"]
     H["metrics table"]
   end
+  subgraph pg["Postgres"]
+    S[("baselines.snapshots")]
+    R[("forecast.retrain")]
+  end
   subgraph w1["worker A"]
-    A1["peers = DNS records or SHARD_PEERS, plus self"] --> A2["owner(hash) == self ?"]
+    A1["peers = SHARD_PEERS, DNS records or the heartbeat table, plus self"] --> A2["Hashes(now-SCAN_RANGE, now), one scan cached for HASH_SCAN_TTL"]
+    A2 --> A3["owner(hash) == self ?"]
+    A3 -->|"its subset"| A4["Restore what moved, ForecastRange(ts-1m, ts)"]
+    A2 --> A5["schedule the owned set, claim due retrains fleet-wide"]
+    A5 --> A6["Series(hash, now-LOOKBACK, now), sliced under DRUID_MAX_RANGE"]
   end
   subgraph w2["worker B"]
-    B1["same peer set"] --> B2["owner(hash) == self ?"]
+    B1["same peer set"] --> B2["same scan, cached"]
+    B2 --> B3["owner(hash) == self ?"]
+    B3 -->|"its subset"| B4["Restore what moved, ForecastRange(ts-1m, ts)"]
+    B2 --> B5["schedule the owned set, claim due retrains"]
   end
-  H -->|"Hashes: GROUP BY metric_hash"| A1
-  H -->|"Series for owned hashes only"| A2
-  H -->|"one scan per worker per tick"| B1
-  H -->|"Series for owned hashes only"| B2
-  A2 -->|"last + N minutes"| K["Kafka topic baselines, one key per point"]
-  B2 -->|"last + N minutes"| K
+  H -->|"windowed scan"| A2
+  H -->|"windowed retrain only"| A6
+  H -->|"windowed scan"| B2
+  A5 -->|"FOR UPDATE SKIP LOCKED"| R
+  B5 -->|"FOR UPDATE SKIP LOCKED"| R
+  A6 -->|"FitSeasonalBaseline → SnapshotOf → Put"| S
+  S -->|"updated_at moved"| A4
+  S -->|"updated_at moved"| B4
+  A4 -->|"now.Truncate(1m) + AHEAD_MINUTES"| K["Kafka topic baselines, one key per point"]
+  B4 -->|"now.Truncate(1m) + AHEAD_MINUTES"| K
 ```
 
 Ownership is `owner(hash) = argmax(avalanche(fnv1a(hash | peer)))` over the peer set, so every worker
@@ -303,7 +320,8 @@ Verified with two real worker processes against a stub Druid (six ready hashes):
 - DNS discovery with the real resolver (`SHARD_DNS=localhost`, identities `127.0.0.1` and `::1`) → `m1 m3 m5`
   and `m0 m2 m4`
 - Ambiguous configuration is refused: `set either SHARD_PEERS or SHARD_DNS, not both`, exit 1
-- One eligibility scan per worker per tick, and no `Series` query for a hash a worker does not own
+- One eligibility scan per worker per tick (v2), reused across ticks under `HASH_SCAN_TTL` in v3, and no
+  `Series` query for a hash a worker does not own
 
 Needs your environment:
 
@@ -313,14 +331,19 @@ Needs your environment:
 
 ## Known limits
 
-- **The eligibility scan is not sharded.** Every worker runs `GROUP BY metric_hash` over the whole table each
-  tick, so N workers cost N scans; only the per-hash `Series` load and fit are divided. At 1–4 ms per fit a
-  single worker still fits thousands of hashes per minute, so the scan, not the CPU, is the limit to watch.
+- **The eligibility scan is not sharded.** Every worker runs `GROUP BY metric_hash` over the whole table, so N
+  workers cost N scans; only the per-hash `Series` load and fit are divided. In v3 the scan is windowed
+  (`SCAN_RANGE`, sliced under `DRUID_MAX_RANGE`) and cached for `HASH_SCAN_TTL`, so it costs
+  `N × ceil(SCAN_RANGE / DRUID_MAX_RANGE)` requests per `HASH_SCAN_TTL` instead of one per tick — with the
+  default `SCAN_RANGE=max(2*LOOKBACK,24h)` and `LOOKBACK=336h` that is 28 requests per worker per 5 minutes.
+  At 1–4 ms per fit a single worker still fits thousands of hashes per minute, so the scan, not the CPU, is
+  the limit to watch.
 - **No backfill.** A restart, a scale event or a missed tick costs a lead point; the next tick publishes the
   current one.
 - **Identity must be unique.** Co-located processes and any manual override must not collide, or they
-  publish the same share twice (harmless but wasteful) and the other peers' hashes go unpublished if the
-  list is stale.
+  publish the same share twice (harmless but wasteful — measured on 2048 hashes: 985 published twice and
+  none stranded). Stranding is a separate failure that takes a listed peer with no process (Step 1), not a
+  collision.
 - **Ingestion must stay idempotent.** Keep `doubleMax`/`MAX`, or a handover becomes a doubled baseline.
 - **No HTTP endpoint or probe**, so membership follows pod readiness, not a health check.
 

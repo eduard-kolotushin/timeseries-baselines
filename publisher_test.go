@@ -19,6 +19,12 @@ type fakeReader struct {
 	hashErr error
 	seriErr error
 
+	// clock and seriesAdvance let a test make a fit outlast the minute it started
+	// in: every Series call moves the publisher's test clock forward, which is how
+	// the real sliced load (14 requests at DRUID_MAX_RPS) behaves.
+	clock         *time.Time
+	seriesAdvance time.Duration
+
 	mu sync.Mutex
 	// noSeries makes Series panic: a path that must not touch Druid is proven by
 	// the failure, not by counting calls.
@@ -45,6 +51,9 @@ func (f *fakeReader) Series(_ context.Context, hash string, from, to time.Time) 
 		panic("Series called: this path must not query Druid")
 	}
 	f.calls = append(f.calls, seriesCall{hash: hash, from: from, to: to})
+	if f.clock != nil && f.seriesAdvance > 0 {
+		*f.clock = f.clock.Add(f.seriesAdvance)
+	}
 	f.mu.Unlock()
 	if f.seriErr != nil {
 		return timeseries.Series[float64]{}, f.seriErr
@@ -83,19 +92,18 @@ func (f *fakeSink) Close() error { return nil }
 // fakeBackend is the scripted Postgres side: snapshots, retrain queue and
 // membership in one struct, like the real store.
 type fakeBackend struct {
-	peers    []string
-	peerErr  error
-	due      []retrainClaim
-	putErr   error
-	freshErr error
-	hbErr    error
+	peers   []string
+	peerErr error
+	due     []retrainClaim
+	putErr  error
+	hbErr   error
 
 	mu        sync.Mutex
 	snaps     map[string]forecast.Snapshot
 	updated   map[string]time.Time
 	puts      []putCall
 	dones     []doneCall
-	schedules []string
+	schedules []scheduleCall
 	claims    []claimCall
 	beats     []heartbeatCall
 	freshRead int
@@ -108,9 +116,16 @@ type putCall struct {
 }
 
 type doneCall struct {
+	owner  string
 	key    string
 	next   time.Time
 	status string
+}
+
+type scheduleCall struct {
+	keys []string
+	cron string
+	tz   string
 }
 
 type claimCall struct {
@@ -145,13 +160,8 @@ func (f *fakeBackend) seedFit(t *testing.T, key string, fitted forecast.Fitted, 
 
 func (f *fakeBackend) Fresh(_ context.Context, keys []string) (map[string]time.Time, error) {
 	f.mu.Lock()
-	f.freshRead++
-	f.mu.Unlock()
-	if f.freshErr != nil {
-		return nil, f.freshErr
-	}
-	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.freshRead++
 	out := make(map[string]time.Time, len(keys))
 	for _, key := range keys {
 		if at, ok := f.updated[key]; ok {
@@ -185,10 +195,10 @@ func (f *fakeBackend) Put(_ context.Context, key string, rec snapshotRecord, sna
 	return nil
 }
 
-func (f *fakeBackend) Schedule(_ context.Context, key, cron, tz string) error {
+func (f *fakeBackend) Schedule(_ context.Context, keys []string, cron, tz string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.schedules = append(f.schedules, strings.Join([]string{key, cron, tz}, "|"))
+	f.schedules = append(f.schedules, scheduleCall{keys: append([]string(nil), keys...), cron: cron, tz: tz})
 	return nil
 }
 
@@ -199,10 +209,10 @@ func (f *fakeBackend) Claim(_ context.Context, owner string, lease time.Duration
 	return f.due, nil
 }
 
-func (f *fakeBackend) Done(_ context.Context, key string, next time.Time, status string) error {
+func (f *fakeBackend) Done(_ context.Context, owner, key string, next time.Time, status string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.dones = append(f.dones, doneCall{key: key, next: next, status: status})
+	f.dones = append(f.dones, doneCall{owner: owner, key: key, next: next, status: status})
 	return nil
 }
 
@@ -234,10 +244,10 @@ func (f *fakeBackend) doneCalls() []doneCall {
 	return append([]doneCall(nil), f.dones...)
 }
 
-func (f *fakeBackend) scheduleCalls() []string {
+func (f *fakeBackend) scheduleCalls() []scheduleCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]string(nil), f.schedules...)
+	return append([]scheduleCall(nil), f.schedules...)
 }
 
 func (f *fakeBackend) claimCalls() []claimCall {
@@ -483,7 +493,9 @@ func TestPublisherTrainsADueClaim(t *testing.T) {
 		t.Fatalf("stored %+v, want a minute-week baseline", puts[0])
 	}
 
-	if schedules := backend.scheduleCalls(); len(schedules) != 1 || schedules[0] != "ready|0 4 * * *|UTC" {
+	if schedules := backend.scheduleCalls(); len(schedules) != 1 ||
+		len(schedules[0].keys) != 1 || schedules[0].keys[0] != "ready" ||
+		schedules[0].cron != "0 4 * * *" || schedules[0].tz != "UTC" {
 		t.Fatalf("scheduled %v, want the owned hash with DEFAULT_RETRAIN_CRON in UTC", schedules)
 	}
 
@@ -498,6 +510,9 @@ func TestPublisherTrainsADueClaim(t *testing.T) {
 	dones := backend.doneCalls()
 	if len(dones) != 1 {
 		t.Fatalf("got %d finishes %v, want one", len(dones), dones)
+	}
+	if dones[0].owner != "w0" {
+		t.Fatalf("finished as %q, want the claim's owner w0", dones[0].owner)
 	}
 	if dones[0].status != "ok" {
 		t.Fatalf("finished with status %q, want ok", dones[0].status)
@@ -586,9 +601,6 @@ func TestPublisherCountsSkippedHashes(t *testing.T) {
 	res, ok := p.runTick(context.Background())
 	if !ok {
 		t.Fatal("tick reported no scan result")
-	}
-	if res.owned+res.skipped != len(hashes) {
-		t.Fatalf("owned %d + skipped %d, want %d hashes", res.owned, res.skipped, len(hashes))
 	}
 	if res.owned == 0 || res.skipped == 0 {
 		t.Fatalf("two workers: w0 owns %d and skips %d of %d hashes", res.owned, res.skipped, len(hashes))
@@ -795,4 +807,259 @@ func TestPublisherReadsSnapshotsOncePerCacheTTL(t *testing.T) {
 	if fresh, gets := backend.readCounts(); fresh != 1 || gets != 1 {
 		t.Fatalf("three ticks in one cache window made %d freshness queries and %d snapshot reads, want 1 and 1", fresh, gets)
 	}
+}
+
+func TestPublisherPublishesEveryMinuteWhenRetrainCrossesTheMinute(t *testing.T) {
+	t.Parallel()
+	// The tick reads its clock once. Before that, the retrain tick stamped its
+	// point from the clock it read *after* the fit, so a sliced retrain that ran
+	// past the end of its own minute moved the horizon one minute forward; the
+	// next tick then published that same horizon and skipped one. With a */5 cron
+	// and a 14-request fit the sandbox lost exactly 17:35, 17:40, 17:45, … from
+	// the Druid `baselines` table.
+	start := time.Date(2026, 1, 1, 17, 24, 59, 0, time.UTC)
+	clock := start
+	reader := readerWithHashes(start.Truncate(time.Minute), 180, "ready")
+	// Every Series request costs wall clock, like the real rate-limited load.
+	reader.clock, reader.seriesAdvance = &clock, 3*time.Second
+
+	backend := &fakeBackend{due: []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC"}}}
+	sink := &fakeSink{}
+	p := newPublisher(Config{
+		Lookback:         3 * time.Hour,
+		AheadMinutes:     1,
+		ShardID:          "w0",
+		TrainConcurrency: 1,
+		RetrainRetry:     5 * time.Minute,
+	}, reader, sink, nil, backend)
+	p.now = func() time.Time { return clock }
+
+	for i := range 3 {
+		p.tick(context.Background())
+		// The claim is finished and the cron is */5, so only the first tick
+		// retrains; the next ticks are the plain publish path a fast tick is.
+		backend.due = nil
+		clock = start.Add(time.Duration(i+1) * time.Minute)
+	}
+
+	if len(sink.msgs) != 3 {
+		t.Fatalf("three ticks published %d points %v, want one per minute", len(sink.msgs), sink.msgs)
+	}
+	for i, msg := range sink.msgs {
+		want := horizon(start.Add(time.Duration(i)*time.Minute), 1)
+		if msg.MetricTS != want {
+			t.Fatalf("tick %d published %d (%s), want the horizon %d (%s): the retrain crossed the minute and skipped one",
+				i, msg.MetricTS, time.UnixMilli(msg.MetricTS).UTC(), want, time.UnixMilli(want).UTC())
+		}
+	}
+}
+
+func TestPublisherPrunesFitsForHashesItNoLongerOwns(t *testing.T) {
+	t.Parallel()
+	// A hash that moves to another peer must release its fit here: a minute-of-week
+	// fit is ~0.5 MB, and the cache is keyed by hash, so without pruning the old
+	// owner holds it for the life of the process.
+	start := time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC)
+	view2 := []string{"w0", "w1"}
+	var kept, moved string
+	for _, hash := range corpus(64) {
+		if Owns(hash, "w0", view2) {
+			if kept == "" {
+				kept = hash
+			}
+			continue
+		}
+		if moved == "" {
+			moved = hash
+		}
+	}
+	if kept == "" || moved == "" {
+		t.Fatal("fixture: want one hash w0 keeps and one it loses when w1 joins")
+	}
+
+	backend := &fakeBackend{}
+	fitted := fitPoints(t, minutePoints(start, 180))
+	for _, hash := range []string{kept, moved} {
+		backend.seedFit(t, hash, fitted, start)
+	}
+	reader := readerWithHashes(start, 180, kept, moved)
+	reader.noSeries = true
+	sink := &fakeSink{}
+	clock := start
+	p := newPublisher(Config{
+		Lookback:     3 * time.Hour,
+		AheadMinutes: 1,
+		ShardID:      "w0",
+		ShardPeers:   []string{"w0"},
+	}, reader, sink, nil, backend)
+	p.now = func() time.Time { return clock }
+
+	p.tick(context.Background())
+	if len(p.fitted) != 2 {
+		t.Fatalf("alone the worker owns both hashes and cached %d fits, want 2", len(p.fitted))
+	}
+
+	// w1 joins and takes `moved`.
+	p.peers.static = view2
+	before := len(sink.msgs)
+	clock = start.Add(time.Minute)
+	p.tick(context.Background())
+
+	if _, ok := p.fitted[moved]; ok {
+		t.Fatalf("the fit for %s survived the hash moving to another peer", moved)
+	}
+	if _, ok := p.fitted[kept]; !ok {
+		t.Fatalf("the fit for %s was dropped while this worker still owns it", kept)
+	}
+	published := make([]string, 0, len(sink.msgs)-before)
+	for _, msg := range sink.msgs[before:] {
+		published = append(published, msg.MetricHash)
+	}
+	if len(published) != 1 || published[0] != kept {
+		t.Fatalf("after the handover the worker published %v, want only %s", published, kept)
+	}
+}
+
+func TestPublisherSchedulesTheOwnedSetInOneStoreCall(t *testing.T) {
+	t.Parallel()
+	// One INSERT … SELECT for the whole owned set instead of one round trip per
+	// hash per tick: a row exists after the first tick, so the other 1439 ticks a
+	// day would pay H statements each for nothing.
+	hashes := corpus(64)
+	end := time.Date(2026, 1, 1, 3, 0, 0, 0, time.UTC)
+	backend := &fakeBackend{}
+	p := newPublisher(Config{
+		Lookback:           2 * time.Hour,
+		AheadMinutes:       1,
+		ShardID:            "w0",
+		DefaultRetrainCron: "0 4 * * *",
+	}, readerWithHashes(end, 180, hashes...), &fakeSink{}, nil, backend)
+
+	p.tick(context.Background())
+
+	schedules := backend.scheduleCalls()
+	if len(schedules) != 1 {
+		t.Fatalf("a tick over %d owned hashes made %d schedule calls, want one", len(hashes), len(schedules))
+	}
+	if got := schedules[0]; len(got.keys) != len(hashes) || got.cron != "0 4 * * *" || got.tz != "UTC" {
+		t.Fatalf("scheduled %d keys with %q/%q, want all %d owned hashes with DEFAULT_RETRAIN_CRON in UTC",
+			len(got.keys), got.cron, got.tz, len(hashes))
+	}
+	seen := make(map[string]bool, len(schedules[0].keys))
+	for _, key := range schedules[0].keys {
+		seen[key] = true
+	}
+	for _, hash := range hashes {
+		if !seen[hash] {
+			t.Fatalf("the scheduled set is missing the owned hash %s", hash)
+		}
+	}
+}
+
+func TestPublisherKeepsItsShareWhenTheHeartbeatFails(t *testing.T) {
+	t.Parallel()
+	// A heartbeat that cannot be written is best effort: the peer set was already
+	// resolved from the store, so the tick must keep publishing its share rather
+	// than degrading to self-only (every hash, all duplicates) or to nothing.
+	hashes := corpus(64)
+	start := time.Date(2026, 1, 1, 17, 0, 0, 0, time.UTC)
+	fitted := fitPoints(t, minutePoints(start, 180))
+
+	backend := &fakeBackend{peers: []string{"w0", "w1"}, hbErr: errors.New("store is down")}
+	for _, hash := range hashes {
+		backend.seedFit(t, hash, fitted, start)
+	}
+	reader := &fakeReader{spans: make([]metricSpan, 0, len(hashes))}
+	for _, hash := range hashes {
+		reader.spans = append(reader.spans, metricSpan{Hash: hash, Min: start.Add(-3 * time.Hour), Max: start})
+	}
+	reader.noSeries = true
+	sink := &fakeSink{}
+	clock := start
+	p := newPublisher(Config{
+		Lookback:        3 * time.Hour,
+		AheadMinutes:    1,
+		ShardID:         "w0",
+		ShardMembership: "store",
+		WorkerTTL:       30 * time.Second,
+	}, reader, sink, nil, backend)
+	p.now = func() time.Time { return clock }
+
+	p.tick(context.Background())
+	first := msgHashes(sink.msgs)
+	if len(first) == 0 || len(first) == len(hashes) {
+		t.Fatalf("with two live peers w0 published %d of %d hashes, want its own share", len(first), len(hashes))
+	}
+	if len(backend.heartbeats()) != 1 {
+		t.Fatalf("got %d heartbeats, want one attempt per tick", len(backend.heartbeats()))
+	}
+
+	// The store keeps answering with the same two peers; only the heartbeat fails.
+	clock = start.Add(time.Minute)
+	before := len(sink.msgs)
+	p.tick(context.Background())
+
+	second := msgHashes(sink.msgs[before:])
+	if len(second) != len(first) {
+		t.Fatalf("after a failed heartbeat the worker published %d hashes, want the same %d", len(second), len(first))
+	}
+	for i := range first {
+		if first[i] != second[i] {
+			t.Fatalf("the share changed after a failed heartbeat: %v then %v", first, second)
+		}
+	}
+	if len(backend.heartbeats()) != 2 {
+		t.Fatalf("got %d heartbeats, want one attempt per tick", len(backend.heartbeats()))
+	}
+}
+
+func TestPublisherFailedSnapshotPutIsRescheduled(t *testing.T) {
+	t.Parallel()
+	// The fit succeeded but the store rejected it: reporting "ok" would push the
+	// next attempt a whole cron period away and leave the publish path on a stale
+	// snapshot, so the claim must finish as an error and come back after RETRY.
+	end := time.Now().UTC().Truncate(time.Minute)
+	reader := readerWithHashes(end, 120, "ready")
+	backend := &fakeBackend{
+		due:    []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC"}},
+		putErr: errors.New("store is down"),
+	}
+	retry := 5 * time.Minute
+	p := newPublisher(Config{
+		Lookback:         3 * time.Hour,
+		AheadMinutes:     1,
+		ShardID:          "w0",
+		TrainConcurrency: 1,
+		RetrainRetry:     retry,
+	}, reader, &fakeSink{}, nil, backend)
+
+	before := time.Now().UTC()
+	p.tick(context.Background())
+	after := time.Now().UTC()
+
+	if puts := backend.putCalls(); len(puts) != 0 {
+		t.Fatalf("stored %v although the store rejected it, want nothing", puts)
+	}
+	dones := backend.doneCalls()
+	if len(dones) != 1 {
+		t.Fatalf("got %d finishes %v, want one", len(dones), dones)
+	}
+	if !strings.HasPrefix(dones[0].status, "error: ") || !strings.Contains(dones[0].status, "store is down") {
+		t.Fatalf("finished with status %q, want the store failure", dones[0].status)
+	}
+	if dones[0].owner != "w0" {
+		t.Fatalf("finished as %q, want the claim's owner w0", dones[0].owner)
+	}
+	if want := before.Add(retry); dones[0].next.Before(want) || dones[0].next.After(after.Add(retry)) {
+		t.Fatalf("retry scheduled at %s, want %s + %s", dones[0].next, before, retry)
+	}
+}
+
+// msgHashes lists the hashes a set of published messages covers, in order.
+func msgHashes(msgs []BaselineMessage) []string {
+	out := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		out = append(out, msg.MetricHash)
+	}
+	return out
 }

@@ -3,6 +3,7 @@ package baselines
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/eduard-kolotushin/timeseries"
 )
 
 // windowRE captures the half-open millisecond bounds of a sliced query, which
@@ -151,6 +154,51 @@ func TestDruidSeriesWindowsPartitionTheRange(t *testing.T) {
 	}
 	if !first.Equal(from) || !last.Equal(to.Add(-time.Minute)) {
 		t.Fatalf("series covers [%s, %s], want [%s, %s]", first, last, from, to.Add(-time.Minute))
+	}
+}
+
+func TestDruidSeriesRefusesOverlappingWindows(t *testing.T) {
+	t.Parallel()
+	// Stitching is the only thing between a datasource that repeats or reorders a
+	// row and a silently duplicated point in the fit, so both cases must surface
+	// as the error they are instead of being concatenated.
+	to := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	from := to.Add(-2 * time.Hour)
+	for _, tc := range []struct {
+		name        string
+		overlap     time.Duration
+		want        error
+		wantQueries int
+	}{
+		{name: "the last minute of a window returned twice", overlap: time.Minute, want: timeseries.ErrDuplicateTime, wantQueries: 2},
+		{name: "a window starting before the previous one ended", overlap: 10 * time.Minute, want: timeseries.ErrUnsorted, wantQueries: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newDruidServer(t, func(t *testing.T, attempt int, query string) (any, int) {
+				lo, hi := queryWindow(t, query)
+				if attempt == 2 {
+					// Only the second window misbehaves: the first one is what
+					// makes the overlap visible.
+					lo = lo.Add(-tc.overlap)
+				}
+				return minuteRows(lo.UnixMilli(), hi.UnixMilli()), http.StatusOK
+			})
+			store := newDruidStore(Config{
+				DruidBroker:     srv.URL,
+				DruidDatasource: "metrics",
+				DruidMaxRange:   time.Hour,
+				DruidRetries:    0,
+			}, srv.Client())
+
+			_, err := store.Series(context.Background(), "ready", from, to)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Series over overlapping windows returned %v, want %v", err, tc.want)
+			}
+			if got := len(srv.sqlQueries()); got != tc.wantQueries {
+				t.Fatalf("the failed stitch took %d requests, want %d: it must stop at the bad window", got, tc.wantQueries)
+			}
+		})
 	}
 }
 

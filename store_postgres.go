@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -101,8 +102,10 @@ func (s *postgresStore) ensure(ctx context.Context) error {
 	return nil
 }
 
-// Put stores one model, gzipped: a minute-of-week baseline is 2×30,240 floats,
-// which is 0.3–1.2 MB of JSON and about ten times smaller compressed.
+// Put stores one model, gzipped: a minute-of-week baseline is two arrays of
+// 30,240 floats, which is ~0.55 MB of JSON text and compresses to ~17 KB (the
+// sandbox measures 562,558 bytes of JSON against 17,449 stored), so the column
+// stays out of the way of the row cache.
 func (s *postgresStore) Put(ctx context.Context, key string, rec snapshotRecord, snap forecast.Snapshot) error {
 	if err := s.ensure(ctx); err != nil {
 		return err
@@ -222,19 +225,24 @@ func (s *postgresStore) Peers(ctx context.Context, ttl time.Duration) ([]string,
 	return out, rows.Err()
 }
 
-// Schedule inserts the baseline row for key unless it is already there. An
-// existing row keeps its cron and timezone: the operator owns the schedule, and
-// a worker restart must not reset it. The forecast.retrain table is created by
-// the plugin, so this fails until the plugin has run against the same database.
-func (s *postgresStore) Schedule(ctx context.Context, key, cron, tz string) error {
+// Schedule inserts the baseline rows for keys unless they are already there, in
+// one statement: an owned set of H hashes would otherwise cost H round trips per
+// tick for rows that all exist after the first one. An existing row keeps its
+// cron and timezone: the operator owns the schedule, and a worker restart must
+// not reset it. The forecast.retrain table is created by the plugin, so this
+// fails until the plugin has run against the same database.
+func (s *postgresStore) Schedule(ctx context.Context, keys []string, cron, tz string) error {
+	if len(keys) == 0 {
+		return nil
+	}
 	if err := s.ensure(ctx); err != nil {
 		return err
 	}
 	_, err := s.pool.Exec(ctx, `
 INSERT INTO forecast.retrain (scope, key, cron, timezone, enabled, next_run_at)
-VALUES ('baseline', $1, $2, $3, true, now())
+SELECT 'baseline', k, $2, $3, true, now() FROM unnest($1::text[]) AS k
 ON CONFLICT (scope, key) DO NOTHING
-`, key, cron, tz)
+`, keys, cron, tz)
 	return err
 }
 
@@ -280,15 +288,27 @@ RETURNING r.key, r.cron, r.timezone
 
 // Done releases the claim and sets when the row is next due. A failure passes
 // now+RETRAIN_RETRY as next, so a broken hash is retried instead of being lost.
-func (s *postgresStore) Done(ctx context.Context, key string, next time.Time, status string) error {
+//
+// Only the owner of the claim may finish it: a retrain that outlives its lease
+// has already been handed to another worker by the time it returns, and a stale
+// finisher would overwrite that worker's claim and next_run_at. Zero rows
+// affected therefore means the claim was lost, which is not an error.
+func (s *postgresStore) Done(ctx context.Context, owner, key string, next time.Time, status string) error {
 	if err := s.ensure(ctx); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 UPDATE forecast.retrain
-SET next_run_at = $2, last_run_at = now(), last_status = $3,
+SET next_run_at = $3, last_run_at = now(), last_status = $4,
     claimed_by = NULL, claimed_until = NULL
 WHERE scope = 'baseline' AND key = $1
-`, key, next, status)
-	return err
+  AND (claimed_by IS NULL OR claimed_by = $2)
+`, key, owner, next, status)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		slog.Debug("claim lost", "metric_hash", key, "owner", owner)
+	}
+	return nil
 }
