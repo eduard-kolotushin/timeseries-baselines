@@ -41,7 +41,15 @@ func newRateLimiter(rps int) *rateLimiter {
 	if rps <= 0 {
 		return nil
 	}
-	return &rateLimiter{tick: time.NewTicker(time.Second / time.Duration(rps))}
+	// DRUID_MAX_RPS above 1e9 truncates this period to zero and time.NewTicker
+	// panics on a non-positive duration, so a typo in the environment would take
+	// the worker down at startup. Below a nanosecond the limiter cannot space
+	// anything anyway, so clamp instead.
+	period := time.Second / time.Duration(rps)
+	if period < time.Nanosecond {
+		period = time.Nanosecond
+	}
+	return &rateLimiter{tick: time.NewTicker(period)}
 }
 
 // wait blocks until a token is available or ctx is done.
