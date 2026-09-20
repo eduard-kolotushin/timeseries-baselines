@@ -40,7 +40,7 @@ N workers over one table by rendezvous hashing of `metric_hash` over a peer set 
 
 ## v3 in scope
 
-Train on a schedule, persist the fit, publish from the snapshot. Bounded Druid access (`DRUID_MAX_RANGE` slicing, rate/inflight caps, retry, timeout, optional static auth header), Postgres snapshot store (`baselines.snapshots`, gzip `forecast.Snapshot`), scheduled retrain with a fleet-wide `FOR UPDATE SKIP LOCKED` claim queue on `forecast.retrain`, Postgres-heartbeat membership (`baselines.workers`, `SHARD_MEMBERSHIP=store`), and a publish timestamp of minute-truncated `now` + `AHEAD_MINUTES`.
+Train on a schedule, persist the fit, publish from the snapshot. Bounded Druid access (`DRUID_MAX_RANGE` slicing, rate/inflight caps, retry, timeout, optional static auth header), Postgres snapshot store (`baselines.snapshots`, gzip `forecast.Snapshot`), scheduled retrain with a fleet-wide `FOR UPDATE SKIP LOCKED` claim queue on `forecast.retrain`, Postgres-heartbeat membership (`baselines.workers`, `SHARD_MEMBERSHIP=store`), and a publish timestamp of minute-truncated `now` + `AHEAD_MINUTES`. The v1 span rule reaches every path that decides: a hash is scheduled, trained and published only while its scan span covers `LOOKBACK` (the schedule insert and `emit` are gated on it, and a claim below it is finished as an error rather than fitted), because the retrain path's fit is not the fit that carries the check.
 
 ## v1/v2/v3 out of scope
 

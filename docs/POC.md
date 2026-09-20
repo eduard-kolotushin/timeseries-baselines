@@ -15,6 +15,9 @@ Behaviour described here: worker `052c1a8`, chart value `baselines.replicas`.
 >   `DRUID_TIMEOUT`, `DRUID_RETRIES`). The scan is windowed too, so the eligibility span is `SCAN_RANGE`
 >   (default `max(2*LOOKBACK, 24h)`), not all history: a hash whose data ended before `now - SCAN_RANGE` stops
 >   being eligible.
+> - Eligibility itself is unchanged (`span >= LOOKBACK`), and the store path applies it at every decision it makes:
+>   a hash below it gets no schedule row, is not published even with a stored snapshot, holds no fit in memory,
+>   and a stale row for one is finished as an error instead of being trained on the window that is left.
 > - The published timestamp is minute-truncated `now` + `AHEAD_MINUTES`, not the last observed point + N.
 > - `SHARD_MEMBERSHIP` (`auto` by default) selects the peer source: `SHARD_PEERS`, then `SHARD_DNS`, then the
 >   Postgres heartbeat (`store`), then this worker alone. **`store` is the recommended VM path**: the peer set is

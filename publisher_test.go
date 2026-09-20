@@ -293,8 +293,11 @@ func fitPoints(t *testing.T, points []timeseries.Point[float64]) forecast.Fitted
 	return fitted
 }
 
-// readerWithHashes is a reader where every hash has a ready 1-minute series
-// ending at end.
+// readerWithHashes builds a reader whose hashes each carry n minutes of points,
+// so each hash's scan span is (n-1) minutes. Every test about training or
+// publishing must pick n so that span covers the config's LOOKBACK: below it the
+// tick skips the hash as ineligible, which is the point of the eligibility tests
+// and the reason a 120-point fixture cannot stand in for a trainable hash.
 func readerWithHashes(end time.Time, n int, hashes ...string) *fakeReader {
 	r := &fakeReader{points: make(map[string][]timeseries.Point[float64], len(hashes))}
 	for _, hash := range hashes {
@@ -453,11 +456,137 @@ func TestPublisherPublishesAtTheHorizonFromASnapshot(t *testing.T) {
 	}
 }
 
+// The store path decides eligibility from the scan. It has to: the fit it runs
+// is fitHash, which only rejects an empty window or a non-minute step, so without
+// this the tick inserted a schedule row for every scanned hash and published
+// whatever snapshot a fit had left — a hash with three days of history got the
+// same lead as one with fifteen. The no-store path's equivalent case is
+// TestPublisherTick's "skip short span".
+func TestPublisherSkipsIneligibleHashesOnTheStorePath(t *testing.T) {
+	t.Parallel()
+	end := time.Now().UTC().Truncate(time.Minute)
+	points := map[string][]timeseries.Point[float64]{
+		"ready": minutePoints(end, 200), // 199m of history, over a 3h LOOKBACK
+		"short": minutePoints(end, 30),  // 29m: the fixture's short hash
+	}
+
+	for _, tc := range []struct {
+		name           string
+		hashes         []string // scan order
+		wantSchedule   []string
+		wantPublish    []string
+		wantIneligible int
+	}{
+		{
+			name:           "the eligible hash is scheduled and published, the short one is neither",
+			hashes:         []string{"ready", "short"},
+			wantSchedule:   []string{"ready"},
+			wantPublish:    []string{"ready"},
+			wantIneligible: 1,
+		},
+		{
+			name:           "a short hash alone is silent: no row, no publish, no cached fit",
+			hashes:         []string{"short"},
+			wantSchedule:   nil,
+			wantPublish:    nil,
+			wantIneligible: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := &fakeReader{points: points}
+			backend := &fakeBackend{}
+			for _, hash := range tc.hashes {
+				pts := points[hash]
+				reader.spans = append(reader.spans, metricSpan{Hash: hash, Min: pts[0].Time, Max: pts[len(pts)-1].Time})
+				// Every hash has a stored snapshot, the short one included: a fit
+				// in the store is not an entitlement to publish (in the sandbox
+				// the short hash has one, left by the round that trained it).
+				backend.seedFit(t, hash, fitPoints(t, pts), end)
+			}
+			reader.noSeries = true
+			sink := &fakeSink{}
+			p := newPublisher(Config{
+				Lookback:     3 * time.Hour,
+				AheadMinutes: 1,
+				ShardID:      "w0",
+			}, reader, sink, nil, backend)
+
+			res, ok := p.runTick(context.Background())
+			if !ok {
+				t.Fatal("tick failed")
+			}
+
+			var scheduled []string
+			for _, call := range backend.scheduleCalls() {
+				scheduled = append(scheduled, call.keys...)
+			}
+			if got, want := strings.Join(scheduled, ","), strings.Join(tc.wantSchedule, ","); got != want {
+				t.Fatalf("scheduled %q, want %q", got, want)
+			}
+			var published []string
+			for _, msg := range sink.msgs {
+				published = append(published, msg.MetricHash)
+			}
+			if got, want := strings.Join(published, ","), strings.Join(tc.wantPublish, ","); got != want {
+				t.Fatalf("published %q, want %q", got, want)
+			}
+			if res.ineligible != tc.wantIneligible {
+				t.Fatalf("ineligible %d, want %d", res.ineligible, tc.wantIneligible)
+			}
+			if len(p.fitted) != len(tc.wantPublish) {
+				t.Fatalf("cached %d fits, want %d: an ineligible hash must not hold a fit", len(p.fitted), len(tc.wantPublish))
+			}
+		})
+	}
+}
+
+// A row can outlive the rule that would not create it now: one written by an
+// older binary during a rollout, or one whose history was truncated. It is
+// finished with the reason instead of being trained on the fraction of LOOKBACK
+// that is left, and costs no Druid request to find that out.
+func TestPublisherRefusesToTrainAnIneligibleClaim(t *testing.T) {
+	t.Parallel()
+	end := time.Now().UTC().Truncate(time.Minute)
+	short := minutePoints(end, 30)
+	reader := &fakeReader{
+		spans:  []metricSpan{{Hash: "short", Min: short[0].Time, Max: short[len(short)-1].Time}},
+		points: map[string][]timeseries.Point[float64]{"short": short},
+	}
+	backend := &fakeBackend{due: []retrainClaim{{Key: "short", Cron: "*/5 * * * *", Timezone: "UTC"}}}
+	retry := 5 * time.Minute
+	p := newPublisher(Config{
+		Lookback:         3 * time.Hour,
+		AheadMinutes:     1,
+		ShardID:          "w0",
+		TrainConcurrency: 1,
+		RetrainRetry:     retry,
+	}, reader, &fakeSink{}, nil, backend)
+
+	p.tick(context.Background())
+
+	if calls := len(reader.seriesCalls()); calls != 0 {
+		t.Fatalf("took %d Druid series requests for an ineligible row, want 0", calls)
+	}
+	if len(backend.puts) != 0 {
+		t.Fatalf("stored %d snapshots for an ineligible row, want 0", len(backend.puts))
+	}
+	dones := backend.doneCalls()
+	if len(dones) != 1 {
+		t.Fatalf("finished %d claims, want 1", len(dones))
+	}
+	if !strings.HasPrefix(dones[0].status, "error: only ") || !strings.Contains(dones[0].status, "want 3h0m0s") {
+		t.Fatalf("finished with status %q, want the history shortfall in it", dones[0].status)
+	}
+	if next := dones[0].next; !next.After(time.Now().UTC()) || next.After(time.Now().UTC().Add(retry+time.Minute)) {
+		t.Fatalf("next run %s is not within RETRAIN_RETRY: a broken row must come back", next)
+	}
+}
+
 func TestPublisherTrainsADueClaim(t *testing.T) {
 	t.Parallel()
 	end := time.Now().UTC().Truncate(time.Minute)
 	lookback := 3 * time.Hour
-	reader := readerWithHashes(end, 120, "ready")
+	reader := readerWithHashes(end, 200, "ready")
 	backend := &fakeBackend{due: []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC"}}}
 	sink := &fakeSink{}
 	cfg := Config{
@@ -526,7 +655,7 @@ func TestPublisherTrainsADueClaim(t *testing.T) {
 func TestPublisherRetrainFailureIsRescheduled(t *testing.T) {
 	t.Parallel()
 	end := time.Now().UTC().Truncate(time.Minute)
-	reader := readerWithHashes(end, 120, "ready")
+	reader := readerWithHashes(end, 200, "ready")
 	reader.seriErr = errors.New("druid is down")
 	backend := &fakeBackend{due: []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC"}}}
 	retry := 5 * time.Minute
@@ -820,7 +949,7 @@ func TestPublisherPublishesEveryMinuteWhenRetrainCrossesTheMinute(t *testing.T) 
 	// the Druid `baselines` table.
 	start := time.Date(2026, 1, 1, 17, 24, 59, 0, time.UTC)
 	clock := start
-	reader := readerWithHashes(start.Truncate(time.Minute), 180, "ready")
+	reader := readerWithHashes(start.Truncate(time.Minute), 200, "ready")
 	// Every Series request costs wall clock, like the real rate-limited load.
 	reader.clock, reader.seriesAdvance = &clock, 3*time.Second
 
@@ -883,7 +1012,7 @@ func TestPublisherPrunesFitsForHashesItNoLongerOwns(t *testing.T) {
 	for _, hash := range []string{kept, moved} {
 		backend.seedFit(t, hash, fitted, start)
 	}
-	reader := readerWithHashes(start, 180, kept, moved)
+	reader := readerWithHashes(start, 200, kept, moved)
 	reader.noSeries = true
 	sink := &fakeSink{}
 	clock := start
@@ -1020,7 +1149,7 @@ func TestPublisherFailedSnapshotPutIsRescheduled(t *testing.T) {
 	// next attempt a whole cron period away and leave the publish path on a stale
 	// snapshot, so the claim must finish as an error and come back after RETRY.
 	end := time.Now().UTC().Truncate(time.Minute)
-	reader := readerWithHashes(end, 120, "ready")
+	reader := readerWithHashes(end, 200, "ready")
 	backend := &fakeBackend{
 		due:    []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC"}},
 		putErr: errors.New("store is down"),

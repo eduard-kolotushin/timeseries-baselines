@@ -59,13 +59,16 @@ type snapshotFit struct {
 	fitted    forecast.Fitted
 }
 
-// tickResult is one pass, logged as a single line.
+// tickResult is one pass, logged as a single line. owned and skipped are the
+// sharding view (what this worker owns, what another peer owns); ineligible is
+// the subset of owned hashes the scan says has too little history to train.
 type tickResult struct {
-	peers     int
-	owned     int
-	skipped   int
-	published int
-	retrained int
+	peers      int
+	owned      int
+	skipped    int
+	ineligible int
+	published  int
+	retrained  int
 }
 
 func newPublisher(cfg Config, src metricReader, sink baselineSink, cal *forecast.Calendar, store storeBackend) *Publisher {
@@ -162,9 +165,15 @@ func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 	}
 	keys := ownedKeys(spans, p.peers.self, peers)
 	p.heartbeat(ctx, len(keys), len(peers))
-	res := tickResult{peers: len(peers), owned: len(keys), skipped: len(spans) - len(keys)}
-	res.retrained = p.retrain(ctx, keys)
-	res.published = p.emit(ctx, spans, keys, peers, now)
+	ready := readyKeys(spans, p.peers.self, peers, p.cfg.Lookback)
+	res := tickResult{
+		peers:      len(peers),
+		owned:      len(keys),
+		skipped:    len(spans) - len(keys),
+		ineligible: len(keys) - len(ready),
+	}
+	res.retrained = p.retrain(ctx, ready)
+	res.published = p.emit(ctx, spans, ready, peers, now)
 	return res, true
 }
 
@@ -207,10 +216,12 @@ func (p *Publisher) heartbeat(ctx context.Context, owned, peers int) {
 	p.hbWarned = false
 }
 
-// retrain schedules every owned hash that has no row yet, then claims due rows
-// fleet-wide and trains them. Claims are deliberately not restricted to owned
-// hashes: any worker may run any schedule, which is what keeps a retrain alive
-// when the hash's rendezvous owner is down.
+// retrain schedules every owned hash that is eligible and has no row yet, then
+// claims due rows fleet-wide and trains them. Claims are deliberately not
+// restricted to owned hashes: any worker may run any schedule, which is what
+// keeps a retrain alive when the hash's rendezvous owner is down. claims are
+// still checked against this worker's scan (see trainable), so a row below
+// LOOKBACK is finished with a reason instead of trained.
 func (p *Publisher) retrain(ctx context.Context, keys []string) int {
 	if p.store == nil {
 		return 0
@@ -263,7 +274,10 @@ func (p *Publisher) retrain(ctx context.Context, keys []string) int {
 // owner of the claim: a lease that expired while this retrain ran has already
 // been re-claimed, and that worker's row must not be overwritten from here.
 func (p *Publisher) trainHash(ctx context.Context, c retrainClaim, now time.Time) bool {
-	err := p.fitHash(ctx, c.Key, now)
+	err := p.trainable(c.Key)
+	if err == nil {
+		err = p.fitHash(ctx, c.Key, now)
+	}
 	if err == nil {
 		var next time.Time
 		if next, err = nextRun(c.Cron, c.Timezone, now); err == nil {
@@ -276,6 +290,26 @@ func (p *Publisher) trainHash(ctx context.Context, c retrainClaim, now time.Time
 	// fire: the row is broken now, and waiting until tomorrow hides it.
 	p.finish(ctx, c, now.Add(p.cfg.RetrainRetry), "error: "+err.Error())
 	return false
+}
+
+// trainable rejects a claim the scan already knows is below LOOKBACK, before a
+// Druid request is spent on it. A row can outlive the rule that would not create
+// it now — written by an older binary during a rollout, or left by a hash whose
+// history was truncated — and it must be recorded as broken rather than trained
+// on the fraction of the window that is left. A key this worker's scan does not
+// carry is left to fitHash, which reports the missing data itself.
+func (p *Publisher) trainable(key string) error {
+	for _, span := range p.scanSpans {
+		if span.Hash != key {
+			continue
+		}
+		if !eligible(span, p.cfg.Lookback) {
+			return fmt.Errorf("only %s of history in the last %s, want %s",
+				span.Max.Sub(span.Min), p.cfg.ScanRange, p.cfg.Lookback)
+		}
+		return nil
+	}
+	return nil
 }
 
 func (p *Publisher) finish(ctx context.Context, c retrainClaim, next time.Time, status string) {
@@ -315,11 +349,12 @@ func (p *Publisher) fitHash(ctx context.Context, key string, now time.Time) erro
 	}, snap)
 }
 
-// emit publishes one point per owned hash and reports how many another worker
-// owns, so a single tick line describes the whole fleet. now is the tick's own
-// start, not the moment the retrain happened to finish: the horizon this tick
-// owes is now.Truncate(1m) + AHEAD_MINUTES, and a retrain that runs across a
-// minute boundary must publish that minute, not skip it.
+// emit publishes one point per owned, eligible hash and returns how many were
+// published. keys is the ready set: the snapshot cache is loaded and pruned for
+// it, so a hash below LOOKBACK keeps no fit in memory either. now is the tick's
+// own start, not the moment the retrain happened to finish: the horizon this
+// tick owes is now.Truncate(1m) + AHEAD_MINUTES, and a retrain that runs across
+// a minute boundary must publish that minute, not skip it.
 func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string, peers []string, now time.Time) int {
 	p.refreshSnapshots(ctx, keys)
 	ts := now.Truncate(time.Minute).Add(time.Duration(p.cfg.AheadMinutes) * time.Minute)
@@ -329,6 +364,12 @@ func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string,
 			return published
 		}
 		if !Owns(span.Hash, p.peers.self, peers) {
+			continue
+		}
+		// A stored snapshot is not an entitlement to publish: a hash whose
+		// history is shorter than LOOKBACK (or shrank to less than it) must not
+		// keep a fresh-looking lead alive from a fit it should never have had.
+		if !eligible(span, p.cfg.Lookback) {
 			continue
 		}
 		ok := false
@@ -387,7 +428,7 @@ func (p *Publisher) emitSnapshot(ctx context.Context, key string, ts time.Time) 
 // after the data. It costs one Druid request per owned hash per tick, which is
 // what snapshots exist to avoid.
 func (p *Publisher) fitForecast(ctx context.Context, span metricSpan) bool {
-	if span.Max.Sub(span.Min) < p.cfg.Lookback {
+	if !eligible(span, p.cfg.Lookback) {
 		return false
 	}
 	s, err := p.src.Series(ctx, span.Hash, span.Max.Add(-p.cfg.Lookback), p.now().UTC())
@@ -533,14 +574,39 @@ func (p *Publisher) logTick(r tickResult) {
 		p.lastPeers, p.lastOwned, p.countsLogged = r.peers, r.owned, true
 	}
 	slog.Debug("tick", "shard", p.peers.self, "peers", r.peers, "owned", r.owned,
-		"skipped", r.skipped, "published", r.published, "retrained", r.retrained)
+		"skipped", r.skipped, "ineligible", r.ineligible, "published", r.published, "retrained", r.retrained)
 }
 
-// ownedKeys returns the hashes this worker publishes, in span order.
+// eligible is the v1 rule that a hash needs a full training window before it is
+// trained or published: the scan's span (its earliest sighting in SCAN_RANGE to
+// its latest) must cover LOOKBACK. The scan reports the hash's real first point,
+// so this is the whole-history test v1 applied, on a window bounded by SCAN_RANGE
+// instead of all time.
+func eligible(span metricSpan, lookback time.Duration) bool {
+	return span.Max.Sub(span.Min) >= lookback
+}
+
+// ownedKeys returns the hashes this worker owns, in span order.
 func ownedKeys(spans []metricSpan, self string, peers []string) []string {
 	out := make([]string, 0, len(spans))
 	for _, span := range spans {
 		if Owns(span.Hash, self, peers) {
+			out = append(out, span.Hash)
+		}
+	}
+	return out
+}
+
+// readyKeys returns the owned hashes that may be trained and published. The
+// store path decides both from this list — the schedule row is inserted for it
+// and emit publishes it — because the fit the retrain path runs is not the fit
+// that carries the eligibility check: fitForecast's gate covers the no-store
+// loop only, so without this the store turned every scanned hash into a trained,
+// published series and a hash with days of history was published like any other.
+func readyKeys(spans []metricSpan, self string, peers []string, lookback time.Duration) []string {
+	out := make([]string, 0, len(spans))
+	for _, span := range spans {
+		if eligible(span, lookback) && Owns(span.Hash, self, peers) {
 			out = append(out, span.Hash)
 		}
 	}

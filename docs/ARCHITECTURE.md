@@ -101,7 +101,7 @@ What sharding does and does not divide:
 
 The scan is the price of eligibility (`min(__time)` over the scan window). Pushing the shard predicate into the SQL (`fnv_hash(metric_hash) % N`) would shrink the response but not the scan, so it is not used: ownership stays in Go, portable and testable.
 
-Two invariants follow from where the checks sit. Eligibility is tested *after* ownership (`tick` asks `Owns` first and the retrain/publish paths apply the lookback), so `LOOKBACK` must be identical fleet-wide — an owner with a shorter lookback drops a hash that no other worker will pick up. And a static peer list must be edited *before* a process is stopped: a listed name with no process strands its share, whereas adding a name only duplicates points until the views converge. The `store` peer source removes both hazards for VMs.
+Two invariants follow from where the checks sit. Eligibility is tested *after* ownership, and `LOOKBACK` must be identical fleet-wide — an owner with a shorter lookback drops a hash that no other worker will pick up. Every path that decides applies that same rule, because the fit the retrain path runs is not the fit that carries the check: `readyKeys` gates the schedule insert, `emit` refuses a span below `LOOKBACK` (a stored snapshot is not an entitlement to publish), and `trainable` finishes a claim below it as `error: only … of history …` before Druid is asked. `fitForecast` is the no-store loop's copy of the same test, and the tick line reports the difference as `ineligible`. And a static peer list must be edited *before* a process is stopped: a listed name with no process strands its share, whereas adding a name only duplicates points until the views converge. The `store` peer source removes both hazards for VMs.
 
 Membership changes are not transactional. A handover costs at most one tick for the hashes that moved: the new owner starts publishing its own wall-clock point, and the old owner may publish the same point once more while its view is stale. There is no backfill; the dashboard shows a lead series, not a per-minute ledger.
 
@@ -175,7 +175,7 @@ SELECT 'baseline', k, $2, $3, true, now() FROM unnest($1::text[]) AS k
 ON CONFLICT (scope, org_id, key) DO NOTHING
 ```
 
-`DO NOTHING` is what protects an operator's edit: once a row exists its `cron`, `timezone` and `enabled` are never touched again, however the fleet is restarted or rescaled. It also means an admin may delete a row: a hash that still reports comes back on the next tick with the default cron, while a hash that stopped reporting stays gone — which is how a retired metric's row stops being retrained (and re-queried) forever.
+`DO NOTHING` is what protects an operator's edit: once a row exists its `cron`, `timezone` and `enabled` are never touched again, however the fleet is restarted or rescaled. The insert covers the owned hashes whose scan span covers `LOOKBACK` and nothing else — a hash with less history than the training window gets no row, no fit and no lead, which is v1's `min/max` rule kept in one place — and the tick line reports those hashes as `ineligible`. It also means an admin may delete a row: a hash that still reports *and still has `LOOKBACK` of history* comes back on the next tick with the default cron, while a hash that stopped reporting, or one whose history was truncated below `LOOKBACK`, stays gone — which is how a retired metric's row stops being retrained (and re-queried) forever, and why deleting the row of a hash below the window is the way out of its error retries.
 
 ```sql
 WITH due AS (
@@ -189,7 +189,7 @@ FROM due WHERE r.scope = due.scope AND r.org_id = due.org_id AND r.key = due.key
 RETURNING r.org_id, r.key, r.cron, r.timezone
 ```
 
-`FOR UPDATE SKIP LOCKED` is what makes the claim fleet-wide and safe: two workers ticking at the same second both get rows, but never the same row, and neither blocks. The lease means a worker that dies mid-retrain releases the claim after `RETRAIN_RETRY` (default 5m) rather than stranding it. Because a claim is not tied to ownership, a hash owned by a stopped worker is still retrained on time, and the retrain cost is bounded by `TRAIN_CONCURRENCY` (default 2) per worker regardless of how many rows are due. The claim carries the row's `org_id`, which is how `Done` addresses the row by its full key.
+`FOR UPDATE SKIP LOCKED` is what makes the claim fleet-wide and safe: two workers ticking at the same second both get rows, but never the same row, and neither blocks. The lease means a worker that dies mid-retrain releases the claim after `RETRAIN_RETRY` (default 5m) rather than stranding it. Because a claim is not tied to ownership, a hash owned by a stopped worker is still retrained on time, and the retrain cost is bounded by `TRAIN_CONCURRENCY` (default 2) per worker regardless of how many rows are due. The claim carries the row's `org_id`, which is how `Done` addresses the row by its full key. A claim is then checked against this worker's scan before anything is fitted (`trainable`): a row below `LOOKBACK` is finished with the reason and without a Druid request, so a row that outlived the rule which would not create it now cannot train on the fraction of the window that is left.
 
 Releasing a claim is owner-guarded, because a retrain that outlived its lease has already been re-claimed by another worker:
 
