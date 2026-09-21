@@ -49,15 +49,19 @@ flowchart LR
   subgraph w1["worker A"]
     A1["peers = SHARD_PEERS, DNS records or the heartbeat table, plus self"] --> A2["Hashes(now-SCAN_RANGE, now), one scan cached for HASH_SCAN_TTL"]
     A2 --> A3["owner(hash) == self ?"]
-    A3 -->|"its subset"| A4["Restore what moved, ForecastRange(ts-1m, ts)"]
-    A2 --> A5["schedule the owned set, claim due retrains fleet-wide"]
+    A3 -->|"its subset"| A7["eligible: span >= LOOKBACK ?"]
+    A7 -->|"yes"| A4["Restore what moved, ForecastRange(ts-1m, ts)"]
+    A7 -->|"the eligible owned keys"| A5["schedule the eligible set, claim due retrains fleet-wide"]
+    A7 -->|"no"| A8["ineligible: counted in the tick line, never scheduled, never published"]
     A5 --> A6["Series(hash, now-LOOKBACK, now), sliced under DRUID_MAX_RANGE"]
   end
   subgraph w2["worker B"]
     B1["same peer set"] --> B2["same scan, cached"]
     B2 --> B3["owner(hash) == self ?"]
-    B3 -->|"its subset"| B4["Restore what moved, ForecastRange(ts-1m, ts)"]
-    B2 --> B5["schedule the owned set, claim due retrains"]
+    B3 -->|"its subset"| B7["eligible: span >= LOOKBACK ?"]
+    B7 -->|"yes"| B4["Restore what moved, ForecastRange(ts-1m, ts)"]
+    B7 -->|"the eligible owned keys"| B5["schedule the eligible set, claim due retrains"]
+    B7 -->|"no"| B8["ineligible: counted in the tick line"]
   end
   H -->|"windowed scan"| A2
   H -->|"windowed retrain only"| A6
@@ -70,6 +74,11 @@ flowchart LR
   A4 -->|"now.Truncate(1m) + AHEAD_MINUTES"| K["Kafka topic baselines, one key per point"]
   B4 -->|"now.Truncate(1m) + AHEAD_MINUTES"| K
 ```
+
+The tick's order is scan → ownership → eligibility (`span >= LOOKBACK`) → publish from the snapshot: a
+schedule row is created only for eligible owned hashes, a retrain trains only those, and an owned hash below
+`LOOKBACK` gets neither a row nor a point — it is counted as `ineligible` in the tick line
+(`published`/`retrained`/`ineligible`/`skipped`).
 
 Ownership is `owner(hash) = argmax(avalanche(fnv1a(hash | peer)))` over the peer set, so every worker
 computes the same answer from the same set alone.
