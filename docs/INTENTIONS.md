@@ -20,14 +20,14 @@ One process owns the whole table, or N processes share it by hash (v2). The same
 | Model | `FitSeasonalBaseline` minute-of-week |
 | Source | Druid SQL (not the metrics Kafka topic) |
 | Output | one Kafka message per ready metric per tick, at last timestamp + N minutes |
-| Config | environment variables (and flags), not Grafana jsonData |
+| Config | environment variables, not Grafana jsonData |
 | Scaling | N workers over the same table; rendezvous hashing on `metric_hash` over a peer set (`SHARD_ID` / `SHARD_MEMBERSHIP` = `auto` / `peers` / `dns` / `store`, over `SHARD_PEERS` / `SHARD_DNS` / the `baselines.workers` heartbeat) |
 | Sandbox | sibling `timeseries-grafana-sandbox` |
 | Kubernetes | sibling `timeseries-k8s` (worker image + Helm; no Dockerfile in this repo) |
 
 ## v1 must-have
 
-- Env/flags: Druid broker/datasource, Kafka brokers/baseline topic, lookback, aheadMinutes N, interval, calendar
+- Env: Druid broker/datasource, Kafka brokers/baseline topic, lookback, aheadMinutes N, interval, calendar
 - Distinct `metric_hash` from Druid; skip unless `max(__time)-min(__time) >= lookback`
 - Fit last lookback window with minute-of-week seasonal baseline; skip non-1-minute series
 - Publish `{"metric_hash","metric_ts","baseline_value"}` to the baseline Kafka topic (`metric_ts` Unix ms = last + N minutes)
@@ -96,4 +96,4 @@ Train on a schedule, persist the fit, publish from the snapshot, and bound every
 - One O(n) fit per hash per retrain; O(1) per horizon step; pre-size series slices to the window length
 - Ownership hashing must not allocate per hash: no joined `hash|peer` string
 - Dependencies stay minimal: `github.com/robfig/cron/v3` for the 5-field schedule and `github.com/jackc/pgx/v5` for the store, on top of `timeseries`, `timeseries-forecast`, and `kafka-go`
-- GitHub Actions on `main` runs `gofmt` and `go test ./...`
+- GitHub Actions on `main` runs `gofmt` and `go test -race ./...` against a `postgres:17` service (`BASELINE_TEST_PG`)

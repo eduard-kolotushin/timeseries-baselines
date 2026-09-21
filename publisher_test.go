@@ -652,6 +652,55 @@ func TestPublisherTrainsADueClaim(t *testing.T) {
 	}
 }
 
+// A tick stamps every time it owes from the clock it read at its start. The
+// retrain used to read the clock a second time, so a slow tick trained and
+// scheduled from an hour it had not started in.
+func TestPublisherStampsEveryStepFromTheTicksClock(t *testing.T) {
+	t.Parallel()
+	end := time.Date(2026, 1, 1, 3, 0, 0, 0, time.UTC)
+	start := time.Date(2026, 1, 1, 3, 7, 0, 0, time.UTC)
+	later := start.Add(time.Hour)
+	reader := readerWithHashes(end, 200, "ready")
+	backend := &fakeBackend{due: []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC"}}}
+	p := newPublisher(Config{
+		Lookback:         3 * time.Hour,
+		AheadMinutes:     1,
+		ShardID:          "w0",
+		TrainConcurrency: 1,
+		RetrainRetry:     5 * time.Minute,
+	}, reader, &fakeSink{}, nil, backend)
+
+	// The first read is the tick's; every later read is the bug this pins.
+	var reads int
+	p.now = func() time.Time {
+		reads++
+		if reads == 1 {
+			return start
+		}
+		return later
+	}
+
+	p.tick(context.Background())
+
+	if reads != 1 {
+		t.Fatalf("read the clock %d times in one tick, want exactly once", reads)
+	}
+	calls := reader.seriesCalls()
+	if len(calls) != 1 {
+		t.Fatalf("got %d series calls %v, want one per claim", len(calls), calls)
+	}
+	if !calls[0].to.Equal(start) {
+		t.Fatalf("trained over a window ending %s, want the tick's %s", calls[0].to, start)
+	}
+	dones := backend.doneCalls()
+	if len(dones) != 1 {
+		t.Fatalf("got %d finishes %v, want one", len(dones), dones)
+	}
+	if want := time.Date(2026, 1, 1, 3, 10, 0, 0, time.UTC); !dones[0].next.Equal(want) {
+		t.Fatalf("next run %s, want %s: the next */5 slot after the tick's clock", dones[0].next, want)
+	}
+}
+
 func TestPublisherRetrainFailureIsRescheduled(t *testing.T) {
 	t.Parallel()
 	end := time.Now().UTC().Truncate(time.Minute)

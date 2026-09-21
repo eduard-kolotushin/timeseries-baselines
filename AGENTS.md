@@ -54,4 +54,4 @@ Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics
 - Depend on tagged `timeseries` and `timeseries-forecast` modules; do not add a `replace` directive
 - `make linux` writes `bin/baselines` for the sandbox container
 - Do not copy Series internals; use the public timeseries API only
-- GitHub Actions on `main`: `gofmt` and `go test ./...`
+- GitHub Actions on `main`: `gofmt` and `go test -race ./...` against a `postgres:17` service (`BASELINE_TEST_PG`)

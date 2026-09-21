@@ -172,7 +172,7 @@ func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 		skipped:    len(spans) - len(keys),
 		ineligible: len(keys) - len(ready),
 	}
-	res.retrained = p.retrain(ctx, ready)
+	res.retrained = p.retrain(ctx, ready, now)
 	res.published = p.emit(ctx, spans, ready, peers, now)
 	return res, true
 }
@@ -222,7 +222,7 @@ func (p *Publisher) heartbeat(ctx context.Context, owned, peers int) {
 // keeps a retrain alive when the hash's rendezvous owner is down. claims are
 // still checked against this worker's scan (see trainable), so a row below
 // LOOKBACK is finished with a reason instead of trained.
-func (p *Publisher) retrain(ctx context.Context, keys []string) int {
+func (p *Publisher) retrain(ctx context.Context, keys []string, now time.Time) int {
 	if p.store == nil {
 		return 0
 	}
@@ -242,7 +242,6 @@ func (p *Publisher) retrain(ctx context.Context, keys []string) int {
 	if len(claims) == 0 {
 		return 0
 	}
-	now := p.now().UTC()
 	var (
 		wg    sync.WaitGroup
 		mu    sync.Mutex
@@ -356,7 +355,7 @@ func (p *Publisher) fitHash(ctx context.Context, key string, now time.Time) erro
 // tick owes is now.Truncate(1m) + AHEAD_MINUTES, and a retrain that runs across
 // a minute boundary must publish that minute, not skip it.
 func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string, peers []string, now time.Time) int {
-	p.refreshSnapshots(ctx, keys)
+	p.refreshSnapshots(ctx, keys, now)
 	ts := now.Truncate(time.Minute).Add(time.Duration(p.cfg.AheadMinutes) * time.Minute)
 	published := 0
 	for _, span := range spans {
@@ -374,7 +373,7 @@ func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string,
 		}
 		ok := false
 		if p.store == nil {
-			ok = p.fitForecast(ctx, span)
+			ok = p.fitForecast(ctx, span, now)
 		} else {
 			ok = p.emitSnapshot(ctx, span.Hash, ts)
 		}
@@ -427,11 +426,11 @@ func (p *Publisher) emitSnapshot(ctx context.Context, key string, ts time.Time) 
 // pre-snapshot loop: fit the scan's span and publish the point AHEAD_MINUTES
 // after the data. It costs one Druid request per owned hash per tick, which is
 // what snapshots exist to avoid.
-func (p *Publisher) fitForecast(ctx context.Context, span metricSpan) bool {
+func (p *Publisher) fitForecast(ctx context.Context, span metricSpan, now time.Time) bool {
 	if !eligible(span, p.cfg.Lookback) {
 		return false
 	}
-	s, err := p.src.Series(ctx, span.Hash, span.Max.Add(-p.cfg.Lookback), p.now().UTC())
+	s, err := p.src.Series(ctx, span.Hash, span.Max.Add(-p.cfg.Lookback), now)
 	if err != nil {
 		slog.Error("metric", "metric_hash", span.Hash, "err", err)
 		return false
@@ -486,7 +485,7 @@ func (p *Publisher) publish(ctx context.Context, key string, at time.Time, value
 // Every call also drops the fits this worker no longer owns, before the cache
 // TTL can short-circuit the query: a hash that moved to another peer would
 // otherwise keep ~0.5 MB of fitted state on this process for its whole life.
-func (p *Publisher) refreshSnapshots(ctx context.Context, keys []string) {
+func (p *Publisher) refreshSnapshots(ctx context.Context, keys []string, now time.Time) {
 	if p.store == nil {
 		return
 	}
@@ -494,7 +493,6 @@ func (p *Publisher) refreshSnapshots(ctx context.Context, keys []string) {
 	if len(keys) == 0 {
 		return
 	}
-	now := p.now().UTC()
 	if !p.freshAt.IsZero() && now.Sub(p.freshAt) < p.cfg.SnapshotCacheTTL {
 		return
 	}

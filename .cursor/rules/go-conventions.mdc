@@ -15,7 +15,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## API
 
-- Config from env/flags; `Validate` before run
+- Config from env; `Validate` before run
 - `Publisher.Run` blocks until context cancel
 - Do not mutate caller series
 

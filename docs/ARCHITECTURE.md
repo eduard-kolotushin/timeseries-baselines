@@ -6,7 +6,7 @@ Single package `baselines` plus `cmd/baselines`:
 
 | Path | Responsibility |
 | --- | --- |
-| `config.go` | Env/flag config and validation |
+| `config.go` | Env config and validation |
 | `limits.go` | Stdlib request semaphore (`DRUID_MAX_INFLIGHT`) and token-bucket rate limiter (`DRUID_MAX_RPS`) |
 | `shard.go` | Rendezvous ownership over the peer set; `ShardID` |
 | `membership.go` | Peer source (`SHARD_MEMBERSHIP` = `auto` / `peers` / `dns` / `store`), last-good-set fallback |
@@ -24,9 +24,9 @@ Single package `baselines` plus `cmd/baselines`:
 Each tick (immediate, then every `INTERVAL`):
 
 1. Read the clock once; every timestamp this tick stamps comes from it.
-2. `Heartbeat` this worker into `baselines.workers` (best effort: an error keeps the previous peer set).
-3. Resolve the peer set (see Membership) and drop the hashes another worker owns.
-4. `Hashes(now - SCAN_RANGE, now)` — one Druid scan, sliced under `DRUID_MAX_RANGE` and cached for `HASH_SCAN_TTL`.
+2. Resolve the peer set (see Membership).
+3. `Hashes(now - SCAN_RANGE, now)` — one Druid scan, sliced under `DRUID_MAX_RANGE` and cached for `HASH_SCAN_TTL`. Ownership is computed from the result: the hashes another worker owns are dropped here.
+4. `Heartbeat` this worker into `baselines.workers` (best effort: an error keeps the previous peer set). It runs after the scan because the count it reports is the owned set, and it stays ahead of the retrain and the publish.
 5. Schedule: **one** `INSERT … SELECT … FROM unnest($1::text[]) ON CONFLICT (scope, org_id, key) DO NOTHING` inserts a row for every owned hash that has none (`scope='baseline'`, `org_id=0`, `DEFAULT_RETRAIN_CRON`, `timezone='UTC'`, due now). An existing row keeps its cron, timezone and `enabled`: the operator owns the schedule and a restart must not reset it.
 6. Retrain: `Claim(self, RETRAIN_RETRY, TRAIN_CONCURRENCY)` takes due `forecast.retrain` rows (**any** worker may retrain **any** hash, not only the ones it owns), then per claim: `Series(hash, now-LOOKBACK, now)` → `FitSeasonalBaseline` → `SnapshotOf` → `Put` into `baselines.snapshots` → `Done(self, claim.OrgID, key, next=nextRun(cron, tz, now), "ok")`. A failure writes `last_status='error: …'` and `next_run_at=now()+RETRAIN_RETRY`. `Done` only touches a row this worker still claims (`claimed_by = self`, addressed by the full `(scope, org_id, key)`); a lease that expired mid-retrain appears as zero rows affected, logs `claim lost` at debug, and is not an error.
 7. Publish: for each owned hash whose snapshot is fresh (`SNAPSHOT_CACHE_TTL`, one `Fresh` query for all owned keys per tick, `Restore` only what moved), `ForecastRange(ts-1m, ts)` with `ts = now.Truncate(1m) + AHEAD_MINUTES`, and emit when `ts` is newer than the in-memory `published` mark and the value is not NaN. The one-minute lookback is deliberate: a grid that is not aligned to the wall-clock minute has no point exactly at `ts`, and asking for the exact point would return `ErrEmptyRange` on every tick; on an aligned grid the last point *is* `ts`.
@@ -90,7 +90,7 @@ N workers share one table. Each tick every worker resolves the same peer set and
 
 `store` is what replaces static peer lists on VMs: every tick a worker upserts `(id, last_seen, owned, peers)`, and the peer set is every `id` whose `last_seen` is newer than `now() - WORKER_TTL`. A worker that is stopped stops heartbeating, is dropped from everyone's set within `WORKER_TTL`, and its share moves to the survivors on the next tick. The worker still unions itself in, so a fleet of one, or one that has just started, always owns the whole table rather than idling.
 
-`WORKER_TTL` defaults to `max(30s, 2*INTERVAL)` and must stay longer than `INTERVAL`, which `Validate` enforces. The heartbeat is written at the end of a tick and the peer set is read at the start of the next one, so a TTL at or below `INTERVAL` would expire a healthy worker's own row before it is read; with a two-interval default a departed worker is still gone within two ticks. An **empty** peer-set answer is a valid one and must not fall back to the previous set — that would keep a departed worker in the view and strand the share it owns — so only a real query failure keeps the last good peers.
+`WORKER_TTL` defaults to `max(30s, 2*INTERVAL)` and must stay longer than `INTERVAL`, which `Validate` enforces. The heartbeat is written after the scan and before the retrain in a tick, and the peer set is read at the start of the next one, so a TTL at or below `INTERVAL` would expire a healthy worker's own row before it is read; with a two-interval default a departed worker is still gone within two ticks. An **empty** peer-set answer is a valid one and must not fall back to the previous set — that would keep a departed worker in the view and strand the share it owns — so only a real query failure keeps the last good peers.
 
 
 What sharding does and does not divide:

@@ -9,6 +9,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: overlay
+          POSTGRES_PASSWORD: overlay
+          POSTGRES_DB: overlay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U overlay -d overlay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BASELINE_TEST_PG: postgres://overlay:overlay@localhost:5432/overlay?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -17,4 +33,4 @@ jobs:
       - name: Format
         run: test -z "$(gofmt -l .)"
       - name: Test
-        run: go test ./...
+        run: go test -race ./...
