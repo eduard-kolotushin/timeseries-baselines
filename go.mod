@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/eduard-kolotushin/timeseries v0.1.1
-	github.com/eduard-kolotushin/timeseries-forecast v0.5.0
+	github.com/eduard-kolotushin/timeseries-forecast v0.5.1
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/segmentio/kafka-go v0.4.49
