@@ -25,6 +25,16 @@ const (
 	// orders of magnitude smaller than this; the cap is what keeps a broken or
 	// hostile datasource from pulling the process out of memory.
 	maxDruidReplyBytes = 64 << 20
+
+	// maxDruidWindows bounds how many requests one query may be sliced into. A
+	// window is at least DRUID_MAX_RANGE long and Validate refuses a positive
+	// DRUID_MAX_RANGE below a minute, so a legitimate count is the caller's own
+	// window divided by that minimum (336h at 1m is 20160); this bound is the
+	// guard for a Config that never went through Validate, where
+	// ceil(span/maxRange) could ask for billions of windows — and the slice is
+	// allocated before the first request is sent, so it would take the process
+	// out of memory without asking Druid anything.
+	maxDruidWindows = 1 << 20
 )
 
 type metricSpan struct {
@@ -73,16 +83,44 @@ func newDruidStore(cfg Config, client *http.Client) *druidStore {
 	}
 }
 
+// windowCount is how many requests windows produces for [from, to): one when
+// maxRange <= 0 (the whole range is one request) or the range is empty, else
+// ceil(span/maxRange). It is pure arithmetic, so a caller that only wants the
+// count — the scan debug line — does not build the slice.
+func windowCount(from, to time.Time, maxRange time.Duration) int {
+	span := to.Sub(from)
+	if maxRange <= 0 || span <= 0 {
+		return 1
+	}
+	// Integer division, not (span+maxRange-1)/maxRange: Sub saturates at the
+	// duration limit, where the addition would overflow into a negative count.
+	n := int64(span / maxRange)
+	if span%maxRange != 0 {
+		n++
+	}
+	return int(n)
+}
+
 // windows splits [from, to) into consecutive half-open windows of at most
 // maxRange. Half-open bounds are what makes stitching safe: no row can be
 // returned twice, so Concat only fails on a datasource that itself duplicates or
 // reorders timestamps. maxRange <= 0 keeps one window, which is one request.
-func windows(from, to time.Time, maxRange time.Duration) [][2]time.Time {
+//
+// A span that would need more than maxDruidWindows requests is refused rather
+// than sliced: one query is then at most maxDruidWindows requests, and a
+// misconfiguration fails loudly at the first call instead of allocating a window
+// per millisecond of history before Druid is asked anything.
+func windows(from, to time.Time, maxRange time.Duration) ([][2]time.Time, error) {
 	from, to = from.UTC(), to.UTC()
 	if maxRange <= 0 || !to.After(from) {
-		return [][2]time.Time{{from, to}}
+		return [][2]time.Time{{from, to}}, nil
 	}
-	out := make([][2]time.Time, 0, int(math.Ceil(float64(to.Sub(from))/float64(maxRange))))
+	n := windowCount(from, to, maxRange)
+	if n > maxDruidWindows {
+		return nil, fmt.Errorf("query span %s at DRUID_MAX_RANGE=%s needs %d windows, above the %d-window bound; raise DRUID_MAX_RANGE",
+			to.Sub(from), maxRange, n, maxDruidWindows)
+	}
+	out := make([][2]time.Time, 0, n)
 	for lo := from; lo.Before(to); {
 		hi := lo.Add(maxRange)
 		if hi.After(to) {
@@ -91,7 +129,7 @@ func windows(from, to time.Time, maxRange time.Duration) [][2]time.Time {
 		out = append(out, [2]time.Time{lo, hi})
 		lo = hi
 	}
-	return out
+	return out, nil
 }
 
 // Series returns the metric_hash series over [from, to), one Druid request per
@@ -100,8 +138,12 @@ func windows(from, to time.Time, maxRange time.Duration) [][2]time.Time {
 // quietly feeding the fit duplicated points.
 func (d *druidStore) Series(ctx context.Context, hash string, from, to time.Time) (timeseries.Series[float64], error) {
 	esc := strings.ReplaceAll(hash, `'`, `''`)
+	ws, err := windows(from, to, d.maxRange)
+	if err != nil {
+		return timeseries.Series[float64]{}, err
+	}
 	var out timeseries.Series[float64]
-	for _, w := range windows(from, to, d.maxRange) {
+	for _, w := range ws {
 		lo, hi := w[0], w[1]
 		q := fmt.Sprintf(
 			`SELECT __time, metric_value FROM %s WHERE metric_hash = '%s' AND __time >= MILLIS_TO_TIMESTAMP(%d) AND __time < MILLIS_TO_TIMESTAMP(%d) ORDER BY __time`,
@@ -153,9 +195,13 @@ func (d *druidStore) Series(ctx context.Context, hash string, from, to time.Time
 // window is bounded, Min is clamped to the window start, so a hash whose data
 // ended before now-SCAN_RANGE is no longer reported as eligible.
 func (d *druidStore) Hashes(ctx context.Context, from, to time.Time) ([]metricSpan, error) {
+	ws, err := windows(from, to, d.maxRange)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]metricSpan, 0, 64)
 	index := make(map[string]int, 64)
-	for _, w := range windows(from, to, d.maxRange) {
+	for _, w := range ws {
 		lo, hi := w[0], w[1]
 		q := fmt.Sprintf(
 			`SELECT metric_hash, MIN(__time) AS tmin, MAX(__time) AS tmax FROM %s WHERE __time >= MILLIS_TO_TIMESTAMP(%d) AND __time < MILLIS_TO_TIMESTAMP(%d) GROUP BY 1`,

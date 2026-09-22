@@ -47,9 +47,9 @@ type Config struct {
 
 	// Druid access bounds. The production datasource caps how far a single
 	// request may reach, so every scan and train query is sliced into windows of
-	// at most DruidMaxRange (0 = one request per query); MaxRPS and MaxInflight
-	// cap the request rate and the requests in flight, so a retrain burst cannot
-	// overwhelm it either.
+	// at most DruidMaxRange (0 = one request per query, otherwise at least 1m);
+	// MaxRPS and MaxInflight cap the request rate and the requests in flight, so
+	// a retrain burst cannot overwhelm it either.
 	DruidMaxRange    time.Duration
 	DruidTimeout     time.Duration
 	DruidRetries     int
@@ -211,6 +211,12 @@ func (c Config) Validate() error {
 	}
 	if c.DruidMaxRange < 0 {
 		return fmt.Errorf("DRUID_MAX_RANGE must not be negative")
+	}
+	if c.DruidMaxRange > 0 && c.DruidMaxRange < time.Minute {
+		// A window below the worker's own grid buys nothing (one request per
+		// minute is the densest a series can be) and turns one query into a slice
+		// of millions: LOOKBACK=336h at DRUID_MAX_RANGE=1ms is 1.2e9 windows.
+		return fmt.Errorf("DRUID_MAX_RANGE must be at least 1m (or 0 for one request per window)")
 	}
 	if c.DruidRetries < 0 {
 		return fmt.Errorf("DRUID_RETRIES must not be negative")

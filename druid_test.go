@@ -461,7 +461,10 @@ func TestWindows(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := windows(tc.from, tc.to, tc.maxRange)
+			got, err := windows(tc.from, tc.to, tc.maxRange)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if len(got) != tc.want {
 				t.Fatalf("got %d windows %v, want %d", len(got), got, tc.want)
 			}
@@ -480,6 +483,64 @@ func TestWindows(t *testing.T) {
 				t.Fatalf("the last window ends at %s, want %s", last, tc.to)
 			}
 		})
+	}
+}
+
+// A span that would need more than maxDruidWindows requests is refused instead of
+// sliced. The slice is built before the first request is sent, so a pathological
+// span/range pair — DRUID_MAX_RANGE is validated at startup, but a Config built in
+// code need not pass through Validate — used to ask for billions of entries and
+// take the process out of memory without asking Druid anything.
+func TestWindowsRefusesAnAbsurdSliceCount(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+
+	got, err := windows(base, base.Add(1000*time.Hour), time.Millisecond)
+	if err == nil {
+		t.Fatalf("1000h at 1ms returned %d windows, want the bound error", len(got))
+	}
+	if got != nil {
+		t.Fatalf("windows returned %d windows alongside the error, want none", len(got))
+	}
+	if !strings.Contains(err.Error(), "DRUID_MAX_RANGE") {
+		t.Fatalf("error must name the knob it is about: %v", err)
+	}
+
+	// The bound is inclusive, and the slice really holds one entry per window:
+	// windowCount is what the scan's debug line reports, so it must agree with
+	// the slice the queries iterate.
+	atBound := base.Add(time.Duration(maxDruidWindows) * time.Minute)
+	if n := windowCount(base, atBound, time.Minute); n != maxDruidWindows {
+		t.Fatalf("windowCount at the bound = %d, want %d", n, maxDruidWindows)
+	}
+	got, err = windows(base, atBound, time.Minute)
+	if err != nil {
+		t.Fatalf("a count exactly at the bound must be sliced: %v", err)
+	}
+	if len(got) != maxDruidWindows {
+		t.Fatalf("sliced into %d windows, want %d", len(got), maxDruidWindows)
+	}
+	if _, err := windows(base, atBound.Add(time.Minute), time.Minute); err == nil {
+		t.Fatal("a count one above the bound must be refused")
+	}
+}
+
+// The store surfaces that bound instead of slicing: a pathological window/range
+// pair fails the query before a single request is sent, so a bad config costs an
+// error rather than a slice of billions of windows.
+func TestDruidSeriesRefusesAnAbsurdSliceCount(t *testing.T) {
+	t.Parallel()
+	to := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	store, srv := testDruidStore(t, func(t *testing.T, _ int, query string) (any, int) {
+		lo, hi := queryWindow(t, query)
+		return minuteRows(lo.UnixMilli(), hi.UnixMilli()), http.StatusOK
+	}, Config{DruidMaxRange: time.Millisecond, DruidRetries: 0})
+
+	if _, err := store.Series(context.Background(), "ready", to.Add(-1000*time.Hour), to); err == nil || !strings.Contains(err.Error(), "DRUID_MAX_RANGE") {
+		t.Fatalf("Series err = %v, want the DRUID_MAX_RANGE bound", err)
+	}
+	if queries := srv.sqlQueries(); len(queries) != 0 {
+		t.Fatalf("asked Druid %d times before refusing the slice", len(queries))
 	}
 }
 

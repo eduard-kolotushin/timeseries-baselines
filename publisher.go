@@ -163,9 +163,14 @@ func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 		slog.Error("list hashes", "err", err)
 		return tickResult{}, false
 	}
-	keys := ownedKeys(spans, p.peers.self, peers)
+	// Ownership is a pure function of (hash, self, peers) and the peer set is
+	// fixed for the tick, so it is computed once per span here and the owned-key
+	// list, the ready list and the publish loop all read that one result instead
+	// of re-running the rendezvous hash per span three times.
+	owned := ownedSpans(spans, p.peers.self, peers)
+	keys := ownedKeys(spans, owned)
 	p.heartbeat(ctx, len(keys), len(peers))
-	ready := readyKeys(spans, p.peers.self, peers, p.cfg.Lookback)
+	ready := readyKeys(spans, owned, p.cfg.Lookback)
 	res := tickResult{
 		peers:      len(peers),
 		owned:      len(keys),
@@ -173,7 +178,7 @@ func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 		ineligible: len(keys) - len(ready),
 	}
 	res.retrained = p.retrain(ctx, ready, now)
-	res.published = p.emit(ctx, spans, ready, peers, now)
+	res.published = p.emit(ctx, spans, ready, owned, now)
 	return res, true
 }
 
@@ -195,7 +200,7 @@ func (p *Publisher) scan(ctx context.Context, now time.Time) ([]metricSpan, erro
 		return nil, err
 	}
 	p.scanAt, p.scanSpans, p.scanOK = now, spans, true
-	slog.Debug("scan", "hashes", len(spans), "requests", len(windows(from, now, p.cfg.DruidMaxRange)), "ttl", p.cfg.HashScanTTL.String())
+	slog.Debug("scan", "hashes", len(spans), "requests", windowCount(from, now, p.cfg.DruidMaxRange), "ttl", p.cfg.HashScanTTL.String())
 	return spans, nil
 }
 
@@ -350,19 +355,21 @@ func (p *Publisher) fitHash(ctx context.Context, key string, now time.Time) erro
 
 // emit publishes one point per owned, eligible hash and returns how many were
 // published. keys is the ready set: the snapshot cache is loaded and pruned for
-// it, so a hash below LOOKBACK keeps no fit in memory either. now is the tick's
-// own start, not the moment the retrain happened to finish: the horizon this
-// tick owes is now.Truncate(1m) + AHEAD_MINUTES, and a retrain that runs across
-// a minute boundary must publish that minute, not skip it.
-func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string, peers []string, now time.Time) int {
+// it, so a hash below LOOKBACK keeps no fit in memory either. owned is the tick's
+// ownership decision per span, so this loop does not recompute the rendezvous
+// hash. now is the tick's own start, not the moment the retrain happened to
+// finish: the horizon this tick owes is now.Truncate(1m) + AHEAD_MINUTES, and a
+// retrain that runs across a minute boundary must publish that minute, not skip
+// it.
+func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string, owned []bool, now time.Time) int {
 	p.refreshSnapshots(ctx, keys, now)
 	ts := now.Truncate(time.Minute).Add(time.Duration(p.cfg.AheadMinutes) * time.Minute)
 	published := 0
-	for _, span := range spans {
+	for i, span := range spans {
 		if err := ctx.Err(); err != nil {
 			return published
 		}
-		if !Owns(span.Hash, p.peers.self, peers) {
+		if !owned[i] {
 			continue
 		}
 		// A stored snapshot is not an entitlement to publish: a hash whose
@@ -461,8 +468,12 @@ func (p *Publisher) fitForecast(ctx context.Context, span metricSpan, now time.T
 	return p.publish(ctx, span.Hash, pt.Time, pt.Value)
 }
 
-// publish writes one point unless it is not newer than the last one for that
-// hash, which is how a restart or a repeated tick stays idempotent.
+// publish writes one point unless it is not newer than the last one written for
+// that hash in this process. That mark is a per-process shortcut for a repeated
+// tick, not the idempotence guarantee: a restart forgets it, and the write stays
+// idempotent because the Kafka key is `metric_hash|metric_ts` and the sink's
+// rollup is `doubleMax`, so the same point lands on the same key as the same
+// value.
 func (p *Publisher) publish(ctx context.Context, key string, at time.Time, value float64) bool {
 	ms := at.UTC().UnixMilli()
 	if prev, ok := p.published[key]; ok && ms <= prev {
@@ -584,11 +595,23 @@ func eligible(span metricSpan, lookback time.Duration) bool {
 	return span.Max.Sub(span.Min) >= lookback
 }
 
+// ownedSpans reports, per span, whether this worker owns the hash. The tick
+// computes this once and every step that needs ownership — the owned-key list,
+// the ready list and the publish loop — reads the same answers, so the
+// rendezvous hash runs once per span per tick instead of three times.
+func ownedSpans(spans []metricSpan, self string, peers []string) []bool {
+	out := make([]bool, len(spans))
+	for i, span := range spans {
+		out[i] = Owns(span.Hash, self, peers)
+	}
+	return out
+}
+
 // ownedKeys returns the hashes this worker owns, in span order.
-func ownedKeys(spans []metricSpan, self string, peers []string) []string {
+func ownedKeys(spans []metricSpan, owned []bool) []string {
 	out := make([]string, 0, len(spans))
-	for _, span := range spans {
-		if Owns(span.Hash, self, peers) {
+	for i, span := range spans {
+		if owned[i] {
 			out = append(out, span.Hash)
 		}
 	}
@@ -601,10 +624,10 @@ func ownedKeys(spans []metricSpan, self string, peers []string) []string {
 // that carries the eligibility check: fitForecast's gate covers the no-store
 // loop only, so without this the store turned every scanned hash into a trained,
 // published series and a hash with days of history was published like any other.
-func readyKeys(spans []metricSpan, self string, peers []string, lookback time.Duration) []string {
+func readyKeys(spans []metricSpan, owned []bool, lookback time.Duration) []string {
 	out := make([]string, 0, len(spans))
-	for _, span := range spans {
-		if eligible(span, lookback) && Owns(span.Hash, self, peers) {
+	for i, span := range spans {
+		if owned[i] && eligible(span, lookback) {
 			out = append(out, span.Hash)
 		}
 	}

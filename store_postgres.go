@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 
 	forecast "github.com/eduard-kolotushin/timeseries-forecast"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -238,17 +240,46 @@ func (s *postgresStore) Schedule(ctx context.Context, keys []string, cron, tz st
 	if err := s.ensure(ctx); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `
-INSERT INTO forecast.retrain (scope, key, cron, timezone, enabled, next_run_at)
+	return s.insertSchedules(ctx, "forecast.retrain", keys, cron, tz)
+}
+
+// insertSchedules runs the one-statement insert against table. The table name is
+// a parameter so the stale-key error below can be reproduced against an
+// old-shape copy of the table in tests; every production call passes
+// forecast.retrain.
+func (s *postgresStore) insertSchedules(ctx context.Context, table string, keys []string, cron, tz string) error {
+	_, err := s.pool.Exec(ctx, fmt.Sprintf(`
+INSERT INTO %s (scope, key, cron, timezone, enabled, next_run_at)
 SELECT 'baseline', k, $2, $3, true, now() FROM unnest($1::text[]) AS k
 ON CONFLICT (scope, org_id, key) DO NOTHING
-`, keys, cron, tz)
+`, table), keys, cron, tz)
+	return staleScheduleKeyError(err)
+}
+
+// staleScheduleKeyError names the one condition a table left on the old
+// (scope, key) primary key produces for this insert: with org_id absent it is
+// Postgres 42703 (the conflict target names a column that is not there), and with
+// org_id present but not in the key it is 42P10 (no constraint matches the ON
+// CONFLICT specification). Either way every tick would report one generic
+// constraint error and no schedule would ever be written, so the remedy the
+// operator can apply is named once instead. The plugin migrates the table in
+// place when it starts; this process only reads, claims and finishes rows, so it
+// never runs the DDL itself.
+func staleScheduleKeyError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "42P10" || pgErr.Code == "42703") {
+		return fmt.Errorf("forecast.retrain is keyed (scope, key), not (scope, org_id, key): run the plugin once against this database to migrate it: %w", err)
+	}
 	return err
 }
 
 // Claim takes up to limit due baseline rows and leases them to owner. SKIP
 // LOCKED lets every worker run this statement concurrently without a
 // coordinator, and claimed_until is how a claim comes back after a crash.
+//
+// A superseded row is never claimed: the plugin marks a schedule that a newer key
+// replaced with superseded_at, and both claims skip it so neither side retrains a
+// row that is on its way out.
 func (s *postgresStore) Claim(ctx context.Context, owner string, lease time.Duration, limit int) ([]retrainClaim, error) {
 	if err := s.ensure(ctx); err != nil {
 		return nil, err
@@ -260,6 +291,7 @@ WITH due AS (
     AND enabled
     AND next_run_at IS NOT NULL
     AND next_run_at <= now()
+    AND superseded_at IS NULL
     AND (claimed_until IS NULL OR claimed_until < now())
   ORDER BY next_run_at
   LIMIT $1

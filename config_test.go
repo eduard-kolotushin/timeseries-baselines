@@ -210,6 +210,8 @@ func TestConfigValidate(t *testing.T) {
 		{"ahead", func(c *Config) { c.AheadMinutes = 0 }, "AHEAD_MINUTES"},
 		{"interval", func(c *Config) { c.Interval = time.Millisecond }, "INTERVAL"},
 		{"druid max range", func(c *Config) { c.DruidMaxRange = -time.Hour }, "DRUID_MAX_RANGE"},
+		{"druid max range below a minute", func(c *Config) { c.DruidMaxRange = time.Millisecond }, "DRUID_MAX_RANGE"},
+		{"druid max range at a minute", func(c *Config) { c.DruidMaxRange = time.Minute }, ""},
 		{"druid retries", func(c *Config) { c.DruidRetries = -1 }, "DRUID_RETRIES"},
 		{"druid rps", func(c *Config) { c.DruidMaxRPS = -2 }, "DRUID_MAX_RPS"},
 		{"scan range below lookback", func(c *Config) {

@@ -40,12 +40,12 @@ With no store configured (`BASELINE_STORE_HOST` and `FORECAST_STORE_HOST` both e
 Every request is windowed, sliced, rate-limited, retried, and logged.
 
 ```go
-func (d *druidStore) windows(from, to time.Time) [][2]time.Time  // maxRange <= 0 → the whole range
+func windows(from, to time.Time, maxRange time.Duration) ([][2]time.Time, error)  // maxRange <= 0 → the whole range; a span above maxDruidWindows windows is an error
 func (d *druidStore) Hashes(ctx context.Context, from, to time.Time) ([]metricSpan, error)
 func (d *druidStore) Series(ctx context.Context, hash string, from, to time.Time) (timeseries.Series[float64], error)
 ```
 
-- `DRUID_MAX_RANGE` (default `0`) is the maximum span one SQL request may cover, on top of the window the caller already chose. It is not what bounds a request: `Series` and `Hashes` always take an explicit `[from, to)` — `LOOKBACK` for a train, `SCAN_RANGE` for a scan — so even at `0` (one request for that window) no query is unbounded. `DRUID_MAX_RANGE` only slices that window further, which is what the production datasource's per-request cap needs. Windows are consecutive and half-open, so they partition `[from, to)` exactly: `__time >= MILLIS_TO_TIMESTAMP(lo) AND __time < MILLIS_TO_TIMESTAMP(hi)`.
+- `DRUID_MAX_RANGE` (default `0`) is the maximum span one SQL request may cover, on top of the window the caller already chose. It is not what bounds a request: `Series` and `Hashes` always take an explicit `[from, to)` — `LOOKBACK` for a train, `SCAN_RANGE` for a scan — so even at `0` (one request for that window) no query is unbounded. `DRUID_MAX_RANGE` only slices that window further, which is what the production datasource's per-request cap needs. Windows are consecutive and half-open, so they partition `[from, to)` exactly: `__time >= MILLIS_TO_TIMESTAMP(lo) AND __time < MILLIS_TO_TIMESTAMP(hi)`. A positive `DRUID_MAX_RANGE` below `1m` is rejected at startup: a window shorter than the worker's own minute grid buys nothing and turns one query into a slice of millions (`LOOKBACK=336h` at `1ms` is 1.2e9 windows). One query is also sliced into at most `maxDruidWindows` (1,048,576) requests — a span that would need more is refused at the first call, before the window slice is allocated, so a `Config` that never went through `Validate` fails loudly instead of taking the process out of memory.
 - `Series` runs **exactly one query per window** and stitches them with `timeseries.Concat`, which returns `ErrDuplicateTime` / `ErrUnsorted` if the datasource ever returns an overlapping or out-of-order window. That loud failure is preferred over silently duplicated points, and it is why the pre-v3 whole-series `from`-only query and its `COUNT(*)` pre-size probe are gone.
 - Buffers are pre-sized to `int(hi.Sub(lo)/time.Minute) + 1` per window instead of to a `COUNT(*)`.
 - One reply is capped at 64 MiB: a longer body is refused with `druid sql reply exceeds N bytes` and is **not** retried, since the same query returns the same oversized body. A series window holds at most one row per minute and a scan is aggregate-only, so a legitimate reply is orders of magnitude smaller; the cap is what keeps a broken or hostile datasource from reading the process out of memory.
@@ -158,7 +158,7 @@ No host and no URL means persist off: `store == nil`, the schedule and heartbeat
 
 ## Retrain schedule
 
-`forecast.retrain` is created and owned by `timeseries-grafana` (Phase 4 of the plan); the worker only inserts `scope='baseline'` rows, claims them, and finishes them. One row per hash, `PRIMARY KEY (scope, org_id, key)` with the worker's rows at the fleet-wide `org_id = 0` (it has no notion of a Grafana org, and the plugin's panel rows are per-org, which is why the org is part of the key rather than a column).
+`forecast.retrain` is created and owned by `timeseries-grafana` (Phase 4 of the plan); the worker only inserts `scope='baseline'` rows, claims them, and finishes them. A table left on the old `(scope, key)` primary key is named as such rather than surfacing the raw Postgres error every tick: the insert reports `forecast.retrain is keyed (scope, key), not (scope, org_id, key): run the plugin once against this database to migrate it`, wrapping Postgres `42703` (the conflict target names a column that is not there) or `42P10` (no constraint matches the `ON CONFLICT` specification). The plugin migrates the table in place when it starts; this process never runs DDL on another component's table. One row per hash, `PRIMARY KEY (scope, org_id, key)` with the worker's rows at the fleet-wide `org_id = 0` (it has no notion of a Grafana org, and the plugin's panel rows are per-org, which is why the org is part of the key rather than a column).
 
 | Column | Worker use |
 | --- | --- |
@@ -168,6 +168,7 @@ No host and no URL means persist off: `store == nil`, the schedule and heartbeat
 | `next_run_at` | Due when `<= now()`. Set to `nextRun(cron, tz, now)` on success and to `now + RETRAIN_RETRY` on failure |
 | `claimed_by`, `claimed_until` | Lease: a row is claimable while `claimed_until IS NULL OR claimed_until < now()` |
 | `last_status` | `ok`, or `error: <message>` |
+| `superseded_at` | Set by the plugin on a schedule a newer key replaced. Never claimed by either side, so a superseded row is not retrained |
 
 The worker schedules its owned set with one statement per tick, not one per hash:
 
@@ -183,6 +184,7 @@ ON CONFLICT (scope, org_id, key) DO NOTHING
 WITH due AS (
   SELECT scope, org_id, key FROM forecast.retrain
   WHERE scope = 'baseline' AND enabled AND next_run_at IS NOT NULL AND next_run_at <= now()
+    AND superseded_at IS NULL
     AND (claimed_until IS NULL OR claimed_until < now())
   ORDER BY next_run_at LIMIT $2 FOR UPDATE SKIP LOCKED
 )
@@ -282,7 +284,7 @@ Same as `timeseries-forecast`: last timestamp + `k * step` for `k = 1..h`. This 
 | --- | --- | --- |
 | `DRUID_BROKER` | (required) | Absolute broker URL |
 | `DRUID_DATASOURCE` | `metrics` | `[A-Za-z0-9_]+` table name |
-| `DRUID_MAX_RANGE` | `0` | Maximum span one Druid request may cover, on top of the `LOOKBACK`/`SCAN_RANGE` window the caller already set; `0` = do not slice it further (still one request for one window, never an unbounded query) |
+| `DRUID_MAX_RANGE` | `0` | Maximum span one Druid request may cover, on top of the `LOOKBACK`/`SCAN_RANGE` window the caller already set; `0` = do not slice it further (still one request for one window, never an unbounded query). A positive value must be at least `1m`, and one query is sliced into at most 1,048,576 requests |
 | `DRUID_TIMEOUT` | `60s` | HTTP client timeout per request |
 | `DRUID_RETRIES` | `2` | Extra attempts after a transport error or 5xx (250ms → 2s backoff); never retries 4xx |
 | `DRUID_MAX_RPS` | `4` | Requests per second to Druid; `0` = off |
@@ -316,7 +318,7 @@ Empty `SHARD_PEERS`, `SHARD_DNS`, and store mean one worker owns every hash. Set
 - One O(n) `FitSeasonalBaseline` per retrain, not per tick: publishing is a `Restore` plus one `ForecastRange(ts-1m, ts)` per owned hash
 - `Series` buffers are pre-sized per window from the window length, not from a `COUNT(*)`
 - Do not keep the training series after fit. `timeseries.Concat` is not incremental: it allocates a new `a.Len()+b.Len()` buffer and copies the accumulator plus the new window into it, so stitching `W` windows copies `O(W²)` points in total — 14 windows of 24h over a 336h lookback copy 91 window-loads, and the final copy holds the whole series. The window count (`ceil(window / DRUID_MAX_RANGE)`) is therefore the cost driver; the fit itself stays linear
-- Ownership is `len(peers)` allocation-free hashes per hash per tick, and the whole check is skipped when a worker is alone
+- Ownership is `len(peers)` allocation-free hashes, computed **once** per hash per tick: the owned-key list, the ready list and the publish loop all read that one result, and the whole check is skipped when a worker is alone
 - Pruning the fit cache reuses one owned-key set per publisher, so it allocates nothing per tick
 - `Fresh` is one query per tick for all owned keys; `Restore` runs only for keys whose `updated_at` moved; the schedule is one statement per tick for the whole owned set
 

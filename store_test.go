@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -227,18 +228,52 @@ func TestPostgresMembership(t *testing.T) {
 	}
 }
 
-// TestPostgresRetrainQueue covers the worker's side of forecast.retrain. The
-// table is created by the plugin, so this skips until the plugin has run against
-// the same database.
+// pluginRetrainDDL is forecast.retrain as timeseries-grafana creates it
+// (pkg/plugin/store_postgres.go), plus the superseded_at column the plugin adds for
+// a schedule a newer key replaced. It lives here as a test fixture: the table is
+// created and owned by the plugin — this process only reads, claims and finishes
+// rows in it — so the worker's insert/claim/finish SQL would run in no test at all
+// when the database has never seen the plugin (CI provisions a bare postgres:17).
+const pluginRetrainDDL = `
+CREATE SCHEMA IF NOT EXISTS forecast;
+CREATE TABLE IF NOT EXISTS forecast.retrain (
+  scope TEXT NOT NULL,
+  key TEXT NOT NULL,
+  org_id BIGINT NOT NULL DEFAULT 0,
+  cron TEXT NOT NULL,
+  timezone TEXT NOT NULL DEFAULT 'UTC',
+  enabled BOOLEAN NOT NULL DEFAULT true,
+  spec JSONB,
+  next_run_at TIMESTAMPTZ,
+  last_run_at TIMESTAMPTZ,
+  last_status TEXT,
+  claimed_by TEXT,
+  claimed_until TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  superseded_at TIMESTAMPTZ,
+  PRIMARY KEY (scope, org_id, key)
+);
+-- A table created before superseded_at joined the row is topped up, which is what
+-- the plugin's own migration does; CREATE TABLE IF NOT EXISTS alone would leave a
+-- legacy table without the column the claim filters on.
+ALTER TABLE forecast.retrain ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
+`
+
+// ensurePluginRetrainTable provides forecast.retrain in the plugin's shape.
+func ensurePluginRetrainTable(t *testing.T, s *postgresStore) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), pluginRetrainDDL); err != nil {
+		t.Fatalf("provide forecast.retrain: %v", err)
+	}
+}
+
+// TestPostgresRetrainQueue covers the worker's side of forecast.retrain: the
+// batched insert, the SKIP LOCKED claim with its lease, the owner-guarded finish,
+// and the two conditions that keep a row out of the claim (a live lease, a
+// superseded schedule).
 func TestPostgresRetrainQueue(t *testing.T) {
 	s, ctx := openTestStore(t)
-	var table *string
-	if err := s.pool.QueryRow(ctx, `SELECT to_regclass('forecast.retrain')::text`).Scan(&table); err != nil {
-		t.Fatal(err)
-	}
-	if table == nil {
-		t.Skip("forecast.retrain does not exist: the plugin has not run against this database")
-	}
+	ensurePluginRetrainTable(t, s)
 	const (
 		key    = "baselines-store-test"
 		second = "baselines-store-test-2"
@@ -386,5 +421,63 @@ SELECT last_status, next_run_at FROM forecast.retrain WHERE scope = 'baseline' A
 	}
 	if status == nil || *status != "ok" || !storedAt.Equal(next) {
 		t.Fatalf("a released claim was written by a stale owner: status=%v next=%s", status, storedAt)
+	}
+
+	// A superseded row is never claimed, however due it is: the plugin marks a
+	// schedule a newer key replaced, and neither claim may retrain it.
+	if _, err := s.pool.Exec(ctx, `
+UPDATE forecast.retrain SET next_run_at = now() - interval '10 years', superseded_at = now()
+WHERE scope = 'baseline' AND key = $1`, key); err != nil {
+		t.Fatal(err)
+	}
+	if claims, err = s.Claim(ctx, "other", time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range claims {
+		if c.Key == key {
+			t.Fatalf("a superseded row was claimed: %+v", c)
+		}
+	}
+}
+
+// TestPostgresScheduleStaleKey: a table still keyed (scope, key) makes every
+// tick's insert fail with a raw Postgres error the operator has no way to read as
+// "the plugin has not migrated this table yet": with org_id absent it is 42703 (the
+// conflict target names a column that is not there) and with org_id present but out
+// of the key it is 42P10 (no constraint matches the ON CONFLICT specification).
+// Both must arrive as the one named condition, and nothing else may be misreported
+// as it.
+func TestPostgresScheduleStaleKey(t *testing.T) {
+	s, ctx := openTestStore(t)
+	const table = "baselines.retrain_stale_key_test"
+	t.Cleanup(func() { _, _ = s.pool.Exec(context.Background(), `DROP TABLE IF EXISTS `+table) })
+	if _, err := s.pool.Exec(ctx, `DROP TABLE IF EXISTS `+table); err != nil {
+		t.Fatal(err)
+	}
+	// The pre-org shape: no org_id column at all, so the conflict target cannot
+	// resolve and the insert fails with 42703.
+	if _, err := s.pool.Exec(ctx, `CREATE TABLE `+table+` (
+  scope TEXT NOT NULL, key TEXT NOT NULL, cron TEXT NOT NULL, timezone TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT true, next_run_at TIMESTAMPTZ,
+  PRIMARY KEY (scope, key)
+)`); err != nil {
+		t.Fatal(err)
+	}
+	err := s.insertSchedules(ctx, table, []string{"stale-key"}, "*/5 * * * *", "UTC")
+	if err == nil {
+		t.Fatal("an insert against a table keyed (scope, key) must fail")
+	}
+	if !strings.Contains(err.Error(), "(scope, org_id, key)") || !strings.Contains(err.Error(), "run the plugin once") {
+		t.Fatalf("stale-key error must name the key shape and the fix: %v", err)
+	}
+
+	// Any other failure keeps its own message: an unrelated error must not be
+	// reported as a migration problem.
+	absent := s.insertSchedules(ctx, table+"_absent", []string{"x"}, "*/5 * * * *", "UTC")
+	if absent == nil {
+		t.Fatal("an insert into an absent table must fail")
+	}
+	if strings.Contains(absent.Error(), "run the plugin once") {
+		t.Fatalf("an absent table was reported as a stale key: %v", absent)
 	}
 }
