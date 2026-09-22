@@ -1,10 +1,10 @@
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/eduard-kolotushin/timeseries v0.1.0 h1:+ssZg0KTLkU2ndZJIUraN0LmVZXPqiU0iYijKMZvWaM=
-github.com/eduard-kolotushin/timeseries v0.1.0/go.mod h1:5rkS0OXN++bnaK6D/NtSMlT9scIEOj0eTMmVX7i2XiI=
-github.com/eduard-kolotushin/timeseries-forecast v0.4.0 h1:izBUALAmGjFzLEA54yUEUViCLQz2nlyfGq4/LdUnsGc=
-github.com/eduard-kolotushin/timeseries-forecast v0.4.0/go.mod h1:NmYvTZlHX3Ouv3F6ez6/Ckc4sYfVzSr93fYmrRj9nms=
+github.com/eduard-kolotushin/timeseries v0.1.1 h1:42mu2m3AwogTE2+J4LsqSLKHNXIWiliZvljLVEZqqhU=
+github.com/eduard-kolotushin/timeseries v0.1.1/go.mod h1:5rkS0OXN++bnaK6D/NtSMlT9scIEOj0eTMmVX7i2XiI=
+github.com/eduard-kolotushin/timeseries-forecast v0.5.0 h1:ZyLOo2lD13UXSj7mZ1adcfq3a2y3lbvhYI/BAXFkAQY=
+github.com/eduard-kolotushin/timeseries-forecast v0.5.0/go.mod h1:NmYvTZlHX3Ouv3F6ez6/Ckc4sYfVzSr93fYmrRj9nms=
 github.com/jackc/pgpassfile v1.0.0 h1:/6Hmqy13Ss2zCq62VdNG8tM1wchn8zjSGOBJ6icpsIM=
 github.com/jackc/pgpassfile v1.0.0/go.mod h1:CEx0iS5ambNFdcRtxPj5JhEz+xB6uRky5eyVu/W2HEg=
 github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 h1:iCEnooe7UlwOQYpKFhBabPMi4aNAfoODPEFNiAnClxo=
