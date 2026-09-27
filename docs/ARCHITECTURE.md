@@ -2,7 +2,7 @@
 
 ## Layout
 
-Single package `baselines` plus `cmd/baselines`:
+Single package `baselines` plus `cmd/baselines` and `cmd/migrate`:
 
 | Path | Responsibility |
 | --- | --- |
@@ -12,12 +12,15 @@ Single package `baselines` plus `cmd/baselines`:
 | `membership.go` | Peer source (`SHARD_MEMBERSHIP` = `auto` / `peers` / `dns` / `store`), last-good-set fallback |
 | `druid.go` | Druid SQL over HTTP: windowed `Hashes` / `Series`, half-open slicing, auth, timeout, retry, limits |
 | `store.go` | Store interfaces (`snapshotStore`, `retrainQueue`, `membership`) and DTOs |
-| `store_postgres.go` | pgx implementation: `baselines.snapshots` (gzip JSON), `baselines.workers` heartbeat, claim/finish of `forecast.retrain` |
+| `migrations.go` | Migration engine: embedded `migrations/*.sql`, `baselines.schema_migrations`, `pg_advisory_xact_lock` — the only schema authority |
+| `migrate_cmd.go` | `MigrateMain`, the `baselines-migrate` CLI a pipeline runs before a worker starts |
+| `store_postgres.go` | pgx implementation: `baselines.snapshots` (gzip JSON) and their `SNAPSHOT_TTL` sweep, `baselines.workers` heartbeat, claim/finish of `forecast.retrain` |
 | `storedsn.go` | `BASELINE_STORE_*` → `FORECAST_STORE_*` DSN resolution |
 | `schedule.go` | `nextRun(cron, tz, now)` over `github.com/robfig/cron/v3` |
 | `kafka.go` | Kafka writer for baseline messages |
 | `publisher.go` | Tick: membership → scan → retrain claims → publish from the snapshot cache |
 | `cmd/baselines` | Process entry: load config, run until SIGINT/SIGTERM |
+| `cmd/migrate` | CI/CD entry: apply the embedded migrations against the store DSN and exit |
 
 ## Data flow
 
@@ -26,10 +29,10 @@ Each tick (immediate, then every `INTERVAL`):
 1. Read the clock once; every timestamp this tick stamps comes from it.
 2. Resolve the peer set (see Membership).
 3. `Hashes(now - SCAN_RANGE, now)` — one Druid scan, sliced under `DRUID_MAX_RANGE` and cached for `HASH_SCAN_TTL`. Ownership is computed from the result: the hashes another worker owns are dropped here.
-4. `Heartbeat` this worker into `baselines.workers` (best effort: an error keeps the previous peer set). It runs after the scan because the count it reports is the owned set, and it stays ahead of the retrain and the publish.
+4. `Heartbeat` this worker into `baselines.workers` (best effort: an error keeps the previous peer set). It runs after the scan because the count it reports is the owned set, and it stays ahead of the retrain and the publish. The tick then sweeps stale snapshots once (`SNAPSHOT_TTL`; see Snapshot store), also best effort.
 5. Schedule: **one** `INSERT … SELECT … FROM unnest($1::text[]) ON CONFLICT (scope, org_id, key) DO NOTHING` inserts a row for every owned hash that has none (`scope='baseline'`, `org_id=0`, `DEFAULT_RETRAIN_CRON`, `timezone='UTC'`, due now). An existing row keeps its cron, timezone and `enabled`: the operator owns the schedule and a restart must not reset it.
 6. Retrain: `Claim(self, RETRAIN_RETRY, TRAIN_CONCURRENCY)` takes due `forecast.retrain` rows (**any** worker may retrain **any** hash, not only the ones it owns), then per claim: `Series(hash, now-LOOKBACK, now)` → `FitSeasonalBaseline` → `SnapshotOf` → `Put` into `baselines.snapshots` → `Done(self, claim.OrgID, key, next=nextRun(cron, tz, now), "ok")`. A failure writes `last_status='error: …'` and `next_run_at=now()+RETRAIN_RETRY`. `Done` only touches a row this worker still claims (`claimed_by = self`, addressed by the full `(scope, org_id, key)`); a lease that expired mid-retrain appears as zero rows affected, logs `claim lost` at debug, and is not an error.
-7. Publish: for each owned hash whose snapshot is fresh (`SNAPSHOT_CACHE_TTL`, one `Fresh` query for all owned keys per tick, `Restore` only what moved), `ForecastRange(ts-1m, ts)` with `ts = now.Truncate(1m) + AHEAD_MINUTES`, and emit when `ts` is newer than the in-memory `published` mark and the value is not NaN. The one-minute lookback is deliberate: a grid that is not aligned to the wall-clock minute has no point exactly at `ts`, and asking for the exact point would return `ErrEmptyRange` on every tick; on an aligned grid the last point *is* `ts`.
+7. Publish: for each owned hash whose snapshot is fresh (`SNAPSHOT_CACHE_TTL`: at most one `Fresh` query for all owned keys per `SNAPSHOT_CACHE_TTL`, `Restore` only what moved), `ForecastRange(ts-1m, ts)` with `ts = now.Truncate(1m) + AHEAD_MINUTES`, and emit when `ts` is newer than the in-memory `published` mark and the value is not NaN. The one-minute lookback is deliberate: a grid that is not aligned to the wall-clock minute has no point exactly at `ts`, and asking for the exact point would return `ErrEmptyRange` on every tick; on an aligned grid the last point *is* `ts`.
 
 `metric_ts` is the wall-clock horizon, not the last observed timestamp, so a Druid outage or a stalled retrain cannot stop publishing as long as a snapshot exists. The clock is read once per tick, before the scan: a tick is one minute of wall clock however long its rate-limited scan and retrain take, so a slow tick still publishes the minute it started in instead of skipping it and colliding with the next tick (see Horizon clock). The metrics Kafka topic is not read; Druid is the source of truth for training. The Kafka key is `metric_hash|metric_ts`, so one point has one key: repeats land on the same partition and can be compacted away. Records are written with `RequiredAcks: RequireAll`: a literal `kafka.Writer` is not `kafka.NewWriter`, which is the only place kafka-go turns a 0 into `RequireAll`, and at 0 (`RequireNone`) the client's `Produce` returns `(nil, nil)`, so a record the broker rejects would look published. With all acks a rejection is an error: it is logged per metric and the point is left unmarked, so the next tick publishes it again instead of losing the minute. Duplicate `(metric_hash, metric_ts)` pairs are also skipped in memory per process, but a restart or a membership change republishes: **consumers must treat the topic as upsert** and collapse duplicates instead of summing them (see Scaling and ingestion).
 
@@ -88,7 +91,7 @@ N workers share one table. Each tick every worker resolves the same peer set and
 | `dns` | The `SHARD_DNS` A records only | Kubernetes headless Service, or a scaled Compose service |
 | `store` | Rows in `baselines.workers` seen within `WORKER_TTL` | VMs that share one Postgres; joins and leaves need no list edit and no DNS |
 
-`store` is what replaces static peer lists on VMs: every tick a worker upserts `(id, last_seen, owned, peers)`, and the peer set is every `id` whose `last_seen` is newer than `now() - WORKER_TTL`. A worker that is stopped stops heartbeating, is dropped from everyone's set within `WORKER_TTL`, and its share moves to the survivors on the next tick. The worker still unions itself in, so a fleet of one, or one that has just started, always owns the whole table rather than idling.
+`store` is what replaces static peer lists on VMs: every tick a worker upserts `(id, worker_id, last_seen, owned, peers)` — the uuid surrogate key plus the identity column the peer set is computed from — and the peer set is every `worker_id` whose `last_seen` is newer than `now() - WORKER_TTL`. A worker that is stopped stops heartbeating, is dropped from everyone's set within `WORKER_TTL`, and its share moves to the survivors on the next tick. The worker still unions itself in, so a fleet of one, or one that has just started, always owns the whole table rather than idling.
 
 `WORKER_TTL` defaults to `max(30s, 2*INTERVAL)` and must stay longer than `INTERVAL`, which `Validate` enforces. The heartbeat is written after the scan and before the retrain in a tick, and the peer set is read at the start of the next one, so a TTL at or below `INTERVAL` would expire a healthy worker's own row before it is read; with a two-interval default a departed worker is still gone within two ticks. An **empty** peer-set answer is a valid one and must not fall back to the previous set — that would keep a departed worker in the view and strand the share it owns — so only a real query failure keeps the last good peers.
 
@@ -116,35 +119,49 @@ type snapshotStore interface {
 	Fresh(ctx context.Context, keys []string) (map[string]time.Time, error)
 	Get(ctx context.Context, key string) (forecast.Snapshot, bool, error)
 	Put(ctx context.Context, key string, rec snapshotRecord, snap forecast.Snapshot) error
+	SweepSnapshots(ctx context.Context, ttl time.Duration) (int64, error)
 }
 ```
 
 Lifecycle: retrain loads `Series(hash, now-LOOKBACK, now)` → `FitSeasonalBaseline` → `SnapshotOf` → `Put`. Publish reads `Fresh(ownedKeys)` once per tick (at most one `SELECT metric_hash, updated_at ... WHERE metric_hash = ANY($1)`) and `Restore`s only the keys that are new or whose `updated_at` moved, keeping a `map[string]struct{ updatedAt time.Time; fitted forecast.Fitted }` cache. A minute-of-week baseline is ~60k floats restored, so restoring unconditionally on the publish path would dominate the tick; `SNAPSHOT_CACHE_TTL` (default 60s) also bounds how often the freshness probe runs.
 
-The cache is pruned on every tick, before the TTL can short-circuit anything: a key this worker no longer owns (the hash moved to another peer on a scale event) is dropped along with its ~0.5 MB fit, so a handover does not pin the old owner's memory for the life of the process. The snapshot itself stays in `baselines.snapshots` and the new owner restores it on its next tick.
+The cache is pruned on every tick, before the TTL can short-circuit anything: a key this worker no longer owns (the hash moved to another peer on a scale event) is dropped along with its ~0.5 MB fit, its warning mark and its in-memory publish mark, so a handover does not pin the old owner's memory for the life of the process. The snapshot itself stays in `baselines.snapshots` and the new owner restores it on its next tick.
 
-Worker-owned DDL (created on first successful use; a pre-provisioned table is accepted):
+Retention follows the same ownership: `baselines.snapshots` is written only by this worker, so its garbage collection lives here too. Once a tick, the publisher deletes a snapshot whose `updated_at` is older than `SNAPSHOT_TTL` (default `72h`; `0` disables the sweep; a positive value below `1h` is rejected, and the window must exceed the retrain cadence — the default cron is daily, hence 72h) **and** whose `forecast.retrain` `baseline` row has no `last_run_at` inside the same window. The two clocks matter: `Done` writes a recent `last_run_at` on every finish, failure included, so a transient Druid or Grafana outage is never mistaken for a dead metric. The sweep is one DELETE per tick, best effort (a failure is logged and the tick proceeds), and reads `forecast.retrain` only — that table stays the plugin's, which removes its own `forecast.snapshots` under `FORECAST_SNAPSHOT_TTL`.
+
+Schema DDL lives in `migrations/0001_snapshots.sql` and `migrations/0002_workers.sql`. `migrations.go` embeds them and applies each file in one transaction that first takes `pg_advisory_xact_lock(0x626173656c696e65)` and records the version in `baselines.schema_migrations`, so two migrators — a pipeline's and a worker's own — serialise instead of racing, and a failing file leaves behind neither its DDL nor its ledger row. `cmd/migrate` (`baselines-migrate`, `make migrate`) runs that engine out-of-process, so a CD pipeline can prepare a database before the worker starts; a worker that never runs it applies the same set at its first store use and accepts an already-provisioned schema. `forecast.retrain` is never touched here: that table belongs to the plugin.
 
 ```sql
+-- 0001_snapshots.sql. On a table that predates the surrogate key the ADD COLUMN
+-- IF NOT EXISTS is a no-op, the backfill fills it, the natural key gets its UNIQUE,
+-- and the primary key is swapped to the uuid.
 CREATE SCHEMA IF NOT EXISTS baselines;
 CREATE TABLE IF NOT EXISTS baselines.snapshots (
-  metric_hash TEXT PRIMARY KEY,
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  metric_hash TEXT NOT NULL,
   model TEXT NOT NULL,
   season TEXT NOT NULL,
   calendar TEXT NOT NULL DEFAULT '',
   lookback_ms BIGINT NOT NULL,
   trained_at TIMESTAMPTZ NOT NULL,
   snapshot BYTEA NOT NULL,          -- gzip(JSON forecast.Snapshot)
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT snapshots_metric_hash_unique UNIQUE (metric_hash)
 );
+-- 0002_workers.sql renames the old text key id -> worker_id before the uuid ADD
+-- COLUMN, which is what frees the name id; a pre-uuid table keeps its rows.
 CREATE TABLE IF NOT EXISTS baselines.workers (
-  id TEXT PRIMARY KEY,
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  worker_id TEXT NOT NULL,
   started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
   owned INTEGER NOT NULL DEFAULT 0,
-  peers INTEGER NOT NULL DEFAULT 0
+  peers INTEGER NOT NULL DEFAULT 0,
+  CONSTRAINT workers_worker_id_unique UNIQUE (worker_id)
 );
 ```
+
+Every primary key this repo owns is a database-generated uuid, and the natural key beside it stays `UNIQUE`, so the upserts the worker already runs (`ON CONFLICT (metric_hash)`, `ON CONFLICT (worker_id)`) keep resolving. `gen_random_uuid()` needs PostgreSQL >= 13. A pre-uuid table is adopted in place, rows and all: on a legacy `baselines.workers` the identity column is renamed `id` → `worker_id`, and a table that has neither column fails loudly inside that file's transaction instead of half-migrating.
 
 The snapshot is stored gzipped because the JSON form of a minute-of-week baseline is two arrays of 30,240 floats (`means` and `ses`) — about 0.55 MB of text — and gzip takes roughly 32× off that: the sandbox row measures 562,558 bytes of JSON against 17,449 bytes stored (`SELECT metric_hash, length(snapshot) FROM baselines.snapshots`).
 
@@ -255,6 +272,7 @@ type snapshotStore interface {
 	Fresh(ctx context.Context, keys []string) (map[string]time.Time, error)
 	Get(ctx context.Context, key string) (forecast.Snapshot, bool, error)
 	Put(ctx context.Context, key string, rec snapshotRecord, snap forecast.Snapshot) error
+	SweepSnapshots(ctx context.Context, ttl time.Duration) (int64, error)
 }
 
 type retrainQueue interface {
@@ -295,6 +313,7 @@ Same as `timeseries-forecast`: last timestamp + `k * step` for `k = 1..h`. This 
 | `SCAN_RANGE` | `0` → `max(2*LOOKBACK, 24h)` | Window of the eligibility scan; when set it must be at least `LOOKBACK + 2*INTERVAL`, because the half-open scan clamps `Min` to the window start and excludes `now` |
 | `TRAIN_CONCURRENCY` | `2` | Whole retrains one worker runs at once |
 | `SNAPSHOT_CACHE_TTL` | `60s` | How often owned snapshots are re-probed for freshness |
+| `SNAPSHOT_TTL` | `72h` | Window after which the tick sweeps a `baselines.snapshots` row nothing refreshed and whose `forecast.retrain` row is idle too; `0` disables, `>=1h` (and must exceed the retrain cadence) |
 | `WORKER_TTL` | `max(30s, 2*INTERVAL)` | A `baselines.workers` row is a peer while `last_seen` is newer than this; must stay longer than `INTERVAL` |
 | `SHARD_MEMBERSHIP` | `auto` | `auto` / `peers` / `dns` / `store` |
 | `DEFAULT_RETRAIN_CRON` | `0 3 * * *` | Cron for a newly scheduled `forecast.retrain` row |
@@ -304,7 +323,7 @@ Same as `timeseries-forecast`: last timestamp + `k * step` for `k = 1..h`. This 
 | `KAFKA_BROKERS` | (required) | Comma-separated brokers |
 | `KAFKA_TOPIC` | `baselines` | Must not be the metrics topic |
 | `LOOKBACK` | `336h` | Eligibility span and fit window |
-| `AHEAD_MINUTES` | `1` | Published timestamp is `now` truncated to the minute + N minutes |
+| `AHEAD_MINUTES` | `1` | Published timestamp is `now` truncated to the minute + N minutes; bound to `1..10080` (a week) at startup |
 | `INTERVAL` | `1m` | Tick period |
 | `CALENDAR` | empty | Empty or `ru` |
 | `SHARD_ID` | first non-loopback IP | This worker's identity in the peer set |

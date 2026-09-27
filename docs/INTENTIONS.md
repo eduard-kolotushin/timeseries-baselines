@@ -4,7 +4,7 @@
 
 Standalone process that publishes minute-of-week seasonal baselines from a Druid table to Kafka. Grafana does not host this ticker. Fit math stays in `timeseries-forecast`.
 
-Implement the loop efficiently: one O(n) fit per ready hash per tick, O(1) work per horizon step, pre-sized series slices.
+Implement the loop efficiently: one O(n) fit per hash per retrain (per tick only when no store is configured), O(1) work per horizon step, pre-sized series slices.
 
 One process owns the whole table, or N processes share it by hash (v2). The same binary runs on a VM or as a Kubernetes workload.
 
@@ -19,7 +19,7 @@ One process owns the whole table, or N processes share it by hash (v2). The same
 | Input series | public `timeseries.Series[float64]` from tagged modules (no `replace`) |
 | Model | `FitSeasonalBaseline` minute-of-week |
 | Source | Druid SQL (not the metrics Kafka topic) |
-| Output | one Kafka message per ready metric per tick, at last timestamp + N minutes |
+| Output | one Kafka message per ready metric per tick, at minute-truncated `now` + `AHEAD_MINUTES` with a store (at last timestamp + N minutes without one) |
 | Config | environment variables, not Grafana jsonData |
 | Scaling | N workers over the same table; rendezvous hashing on `metric_hash` over a peer set (`SHARD_ID` / `SHARD_MEMBERSHIP` = `auto` / `peers` / `dns` / `store`, over `SHARD_PEERS` / `SHARD_DNS` / the `baselines.workers` heartbeat) |
 | Sandbox | sibling `timeseries-grafana-sandbox` |
@@ -89,6 +89,36 @@ Train on a schedule, persist the fit, publish from the snapshot, and bound every
 - Sharding or replicating `baselines.snapshots` / `forecast.retrain`; one shared Postgres is assumed
 - A per-model retrain schedule per hash beyond the single `forecast.retrain` row a worker inserts
 
+## v4 must-have
+
+Version the schema, and make every primary key this repo owns a uuid.
+
+- **Versioned migrations.** `migrations/0001_snapshots.sql` and `migrations/0002_workers.sql` are embedded (`//go:embed`) and are the only schema authority; there is no `ensureSQL` string any more. Each file runs in one transaction that first takes `pg_advisory_xact_lock(0x626173656c696e65)` and re-reads the ledger, so a migrator a pipeline runs and a worker that auto-applies serialise instead of racing, and a failing file leaves behind neither its DDL nor its ledger row. The ledger is this repo's own `baselines.schema_migrations`; a version the binary does not embed is a warning, not a failure
+- **`baselines-migrate` (`cmd/migrate`, `make migrate`)** applies the same set out-of-process, so a CI/CD pipeline can prepare a database before the worker starts. Running it is optional: the worker applies the same set at its first store use and keeps the non-fatal fallback (probe `baselines.snapshots`, retry after `ensureRetryAfter`) when the runtime user may not create or alter anything. Flags: `--dsn` (else `BASELINE_STORE_*`, then `FORECAST_STORE_*`), `--dry-run`, `--timeout` (default 60s)
+- **Uuid primary keys.** Every table this repo owns carries `id uuid PRIMARY KEY DEFAULT gen_random_uuid()` and keeps its natural key as a `UNIQUE` constraint, so the upserts that already exist still resolve: `baselines.snapshots` (`UNIQUE (metric_hash)`) and `baselines.workers` (identity column renamed `id` → `worker_id`, `UNIQUE (worker_id)`, which frees the name `id` for the surrogate). A pre-uuid table is adopted in place and keeps its rows; `gen_random_uuid()` needs PostgreSQL >= 13
+- These migrations stay inside schema `baselines`: `forecast.retrain` is still created and owned by `timeseries-grafana`, and an older `forecast.retrain` is still reported as a stale key rather than migrated here
+
+## v4 non-goals
+
+- A second migration tool (Flyway, goose, golang-migrate) or a schema-diff ORM
+- An integer surrogate key, or a `SERIAL`/sequence, on any table this repo owns
+- Migrating another component's table: `forecast.retrain` belongs to the plugin
+
+## v5 must-have
+
+Collect the worker's own dead snapshots, so a retired metric does not keep its model forever.
+
+- `SNAPSHOT_TTL` (default `72h`, `0` disables the sweep, a positive value below `1h` is rejected at startup) is the window after which the publisher tick deletes a `baselines.snapshots` row that nothing refreshed. It must exceed the retrain cadence: the default `DEFAULT_RETRAIN_CRON=0 3 * * *` is daily, so the default 72h is three cycles and a healthy metric is never collected
+- The rule is "nothing refreshed the snapshot **and** its baseline row is idle": the snapshot's `updated_at` is older than the window, and its `forecast.retrain` `baseline` row has no `last_run_at` inside the window either. The owner-guarded `Done` writes a recent `last_run_at` on every finish, failure included, so a transient Druid or Grafana outage is never mistaken for a dead metric
+- The sweep runs once per tick on the publisher, after the heartbeat, and is best effort: a failure is logged and the rest of the tick proceeds. It reads `forecast.retrain` only — that table is still created and owned by `timeseries-grafana`, and this process never runs DDL against it
+- `baselines.snapshots` is written only by this worker, so its removal belongs here: `timeseries-grafana` removes the plugin's own `forecast.snapshots` under its own `FORECAST_SNAPSHOT_TTL`
+
+## v5 non-goals
+
+- Deleting a model on explicit user intent, or reconciling `forecast.retrain` rows against snapshots: the plugin's schedule API owns both
+- A separate retention process, cron entry, or HTTP surface
+- Sweeping or replicating the plugin's `forecast.snapshots`
+
 ## Quality bar
 
 - Do not mutate caller series (libraries already return new series)
@@ -96,4 +126,5 @@ Train on a schedule, persist the fit, publish from the snapshot, and bound every
 - One O(n) fit per hash per retrain; O(1) per horizon step; pre-size series slices to the window length
 - Ownership hashing must not allocate per hash: no joined `hash|peer` string
 - Dependencies stay minimal: `github.com/robfig/cron/v3` for the 5-field schedule and `github.com/jackc/pgx/v5` for the store, on top of `timeseries`, `timeseries-forecast`, and `kafka-go`
-- GitHub Actions on `main` runs `gofmt` and `go test -race ./...` against a `postgres:17` service (`BASELINE_TEST_PG`)
+- Every primary key this repo owns is a uuid (`gen_random_uuid()`), the natural key beside it is `UNIQUE`, and an applied migration file is never edited
+- GitHub Actions on `main` runs `gofmt` and `go test -race ./...` against a `postgres:17` service (`BASELINE_TEST_PG`), builds the linux worker and migrator, and runs the migration CLI against that service

@@ -106,6 +106,7 @@ type fakeBackend struct {
 	schedules []scheduleCall
 	claims    []claimCall
 	beats     []heartbeatCall
+	sweeps    []time.Duration
 	freshRead int
 	getRead   int
 }
@@ -224,6 +225,13 @@ func (f *fakeBackend) Heartbeat(_ context.Context, id string, owned, peers int) 
 	return f.hbErr
 }
 
+func (f *fakeBackend) SweepSnapshots(_ context.Context, ttl time.Duration) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sweeps = append(f.sweeps, ttl)
+	return 0, nil
+}
+
 func (f *fakeBackend) Peers(context.Context, time.Duration) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -261,6 +269,12 @@ func (f *fakeBackend) heartbeats() []heartbeatCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]heartbeatCall(nil), f.beats...)
+}
+
+func (f *fakeBackend) sweepCalls() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]time.Duration(nil), f.sweeps...)
 }
 
 // readCounts is how many freshness queries and snapshot reads the store served.
@@ -649,6 +663,72 @@ func TestPublisherTrainsADueClaim(t *testing.T) {
 	}
 	if !dones[0].next.After(after) || dones[0].next.Sub(after) > 5*time.Minute || dones[0].next.Minute()%5 != 0 {
 		t.Fatalf("next run %s is not the next */5 minute after %s", dones[0].next, after)
+	}
+}
+
+// Per-hash state is three maps, not one: a hash that moved to another peer must
+// release its publish mark and its warning flag as well as its fit. Without a
+// store the first two are the only per-hash state there is, and emit prunes them
+// in that mode too.
+func TestPruneFitsDropsEveryPerHashMap(t *testing.T) {
+	t.Parallel()
+	p := newPublisher(Config{Lookback: 3 * time.Hour, AheadMinutes: 1, ShardID: "w0"}, nil, nil, nil, nil)
+	p.published["keep"], p.published["moved"] = 1, 2
+	p.warned["keep"], p.warned["moved"] = "no snapshot", "behind horizon"
+	p.fitted["keep"], p.fitted["moved"] = snapshotFit{}, snapshotFit{}
+
+	p.pruneFits([]string{"keep"})
+
+	if len(p.published) != 1 || p.published["keep"] != 1 {
+		t.Fatalf("published = %v, want only keep", p.published)
+	}
+	if len(p.warned) != 1 || p.warned["keep"] != "no snapshot" {
+		t.Fatalf("warned = %v, want only keep", p.warned)
+	}
+	if len(p.fitted) != 1 {
+		t.Fatalf("fitted = %v, want only keep", p.fitted)
+	}
+	// An empty owned set clears all three, so a hash that comes back starts from a
+	// clean mark and republishes its next point.
+	p.pruneFits(nil)
+	if len(p.published) != 0 || len(p.warned) != 0 || len(p.fitted) != 0 {
+		t.Fatalf("an empty owned set left state behind: %v %v %v", p.published, p.warned, p.fitted)
+	}
+}
+
+// A tick sweeps stale snapshots once, using SNAPSHOT_TTL, and does nothing when
+// the knob is 0: retention rides the ticker, so it needs no separate process.
+func TestPublisherSweepsSnapshotsOnTheTick(t *testing.T) {
+	t.Parallel()
+	end := time.Date(2026, 1, 1, 3, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name string
+		ttl  time.Duration
+		want int
+	}{
+		{"sweeps with the configured window", 72 * time.Hour, 1},
+		{"disabled", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			backend := &fakeBackend{}
+			p := newPublisher(Config{
+				Lookback:     2 * time.Hour,
+				AheadMinutes: 1,
+				ShardID:      "w0",
+				SnapshotTTL:  tc.ttl,
+			}, readerWithHashes(end, 180, "ready"), &fakeSink{}, nil, backend)
+			p.tick(context.Background())
+
+			calls := backend.sweepCalls()
+			if len(calls) != tc.want {
+				t.Fatalf("swept %d times, want %d", len(calls), tc.want)
+			}
+			if tc.want == 1 && calls[0] != tc.ttl {
+				t.Fatalf("swept with ttl %s, want %s", calls[0], tc.ttl)
+			}
+		})
 	}
 }
 

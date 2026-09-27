@@ -179,7 +179,7 @@ func TestPostgresMembership(t *testing.T) {
 		second = "baselines-store-test-b"
 	)
 	t.Cleanup(func() {
-		_, _ = s.pool.Exec(context.Background(), `DELETE FROM baselines.workers WHERE id IN ($1, $2)`, first, second)
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM baselines.workers WHERE worker_id IN ($1, $2)`, first, second)
 	})
 
 	if err := s.Heartbeat(ctx, first, 7, 2); err != nil {
@@ -205,7 +205,7 @@ func TestPostgresMembership(t *testing.T) {
 
 	// A heartbeat does not resurrect a worker: the TTL is what retires one that
 	// stopped, and a stale row must not hold its hashes for good.
-	if _, err := s.pool.Exec(ctx, `UPDATE baselines.workers SET last_seen = now() - interval '2 minutes' WHERE id = $1`, second); err != nil {
+	if _, err := s.pool.Exec(ctx, `UPDATE baselines.workers SET last_seen = now() - interval '2 minutes' WHERE worker_id = $1`, second); err != nil {
 		t.Fatal(err)
 	}
 	peers, err = s.Peers(ctx, 30*time.Second)
@@ -220,7 +220,7 @@ func TestPostgresMembership(t *testing.T) {
 
 	// The heartbeat also records what the worker is carrying.
 	var owned, count int
-	if err := s.pool.QueryRow(ctx, `SELECT owned, peers FROM baselines.workers WHERE id = $1`, first).Scan(&owned, &count); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT owned, peers FROM baselines.workers WHERE worker_id = $1`, first).Scan(&owned, &count); err != nil {
 		t.Fatal(err)
 	}
 	if owned != 7 || count != 2 {
@@ -229,14 +229,16 @@ func TestPostgresMembership(t *testing.T) {
 }
 
 // pluginRetrainDDL is forecast.retrain as timeseries-grafana creates it
-// (pkg/plugin/store_postgres.go), plus the superseded_at column the plugin adds for
-// a schedule a newer key replaced. It lives here as a test fixture: the table is
-// created and owned by the plugin — this process only reads, claims and finishes
-// rows in it — so the worker's insert/claim/finish SQL would run in no test at all
-// when the database has never seen the plugin (CI provisions a bare postgres:17).
+// (pkg/store/migrations/0002_retrain.sql), plus the superseded_at column the plugin
+// adds for a schedule a newer key replaced. It lives here as a test fixture: the
+// table is created and owned by the plugin — this process only reads, claims and
+// finishes rows in it — so the worker's insert/claim/finish SQL would run in no test
+// at all when the database has never seen the plugin (CI provisions a bare
+// postgres:17).
 const pluginRetrainDDL = `
 CREATE SCHEMA IF NOT EXISTS forecast;
 CREATE TABLE IF NOT EXISTS forecast.retrain (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   scope TEXT NOT NULL,
   key TEXT NOT NULL,
   org_id BIGINT NOT NULL DEFAULT 0,
@@ -251,7 +253,7 @@ CREATE TABLE IF NOT EXISTS forecast.retrain (
   claimed_until TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   superseded_at TIMESTAMPTZ,
-  PRIMARY KEY (scope, org_id, key)
+  CONSTRAINT retrain_scope_org_key_unique UNIQUE (scope, org_id, key)
 );
 -- A table created before superseded_at joined the row is topped up, which is what
 -- the plugin's own migration does; CREATE TABLE IF NOT EXISTS alone would leave a
@@ -479,5 +481,91 @@ func TestPostgresScheduleStaleKey(t *testing.T) {
 	}
 	if strings.Contains(absent.Error(), "run the plugin once") {
 		t.Fatalf("an absent table was reported as a stale key: %v", absent)
+	}
+}
+
+// TestPostgresSweepSnapshots: the worker collects the snapshots nothing
+// refreshed within SNAPSHOT_TTL whose baseline schedule row is equally idle. A
+// busy row (a recent last_run_at, which the owner-guarded Done writes on every
+// finish, success or failure) pins its snapshot even when updated_at is old,
+// because the metric is still being retrained: a transient outage must not look
+// like a dead metric. The sweep reads forecast.retrain only; this test
+// provisions that table in the plugin's shape, exactly as the DSN path assumes.
+func TestPostgresSweepSnapshots(t *testing.T) {
+	s, ctx := openTestStore(t)
+	ensurePluginRetrainTable(t, s)
+	const (
+		staleIdle = "baselines-sweep-stale-idle"
+		staleBusy = "baselines-sweep-stale-busy"
+		fresh     = "baselines-sweep-fresh"
+	)
+	keys := []string{staleIdle, staleBusy, fresh}
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM baselines.snapshots WHERE metric_hash = ANY($1)`, keys)
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM forecast.retrain WHERE scope = 'baseline' AND key = ANY($1)`, keys)
+	})
+
+	const stale = 8 * 24 * time.Hour
+	seedSnapshot := func(key string, age time.Duration) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, `
+INSERT INTO baselines.snapshots (metric_hash, model, season, calendar, lookback_ms, trained_at, snapshot, updated_at)
+VALUES ($1, 'baseline', 'minute-week', '', 1209600000, now() - ($2 * interval '1 second'), $3, now() - ($2 * interval '1 second'))
+ON CONFLICT (metric_hash) DO UPDATE SET updated_at = EXCLUDED.updated_at
+`, key, int64(age.Seconds()), []byte{0x1f, 0x8b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedRow := func(key string, age time.Duration) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, `
+INSERT INTO forecast.retrain (scope, org_id, key, cron, timezone, enabled, next_run_at, last_run_at)
+VALUES ('baseline', 0, $1, '0 3 * * *', 'UTC', true, now() + interval '1 hour', now() - ($2 * interval '1 second'))
+ON CONFLICT (scope, org_id, key) DO UPDATE SET last_run_at = EXCLUDED.last_run_at, next_run_at = EXCLUDED.next_run_at, superseded_at = NULL
+`, key, int64(age.Seconds())); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Stale snapshot, idle row: nothing has refreshed either, so it is collected.
+	seedSnapshot(staleIdle, stale)
+	seedRow(staleIdle, stale)
+	// Stale snapshot, busy row: a recent finish (the retrain is running) keeps it.
+	seedSnapshot(staleBusy, stale)
+	seedRow(staleBusy, 0)
+	// Fresh snapshot, idle row: the metric is only refreshed by non-retrain
+	// writers, which still counts as fresh.
+	seedSnapshot(fresh, 0)
+	seedRow(fresh, stale)
+
+	n, err := s.SweepSnapshots(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatalf("swept %d rows, want at least the one stale, idle snapshot", n)
+	}
+	var count int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM baselines.snapshots WHERE metric_hash = ANY($1)`, keys).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("kept %d of the three seeded snapshots, want 2", count)
+	}
+	for _, tc := range []struct {
+		key  string
+		want bool
+	}{
+		{staleIdle, false},
+		{staleBusy, true},
+		{fresh, true},
+	} {
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM baselines.snapshots WHERE metric_hash = $1)`, tc.key).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != tc.want {
+			t.Fatalf("snapshot %s exists=%v, want %v", tc.key, exists, tc.want)
+		}
 	}
 }

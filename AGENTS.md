@@ -23,7 +23,7 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - Depend on `timeseries.Series[float64]` and public `forecast.FitSeasonalBaseline`; do not fork Series or models
 - Public ops do not mutate caller series
 - Source of truth is Druid SQL, not the metrics Kafka topic
-- Stay within v1/v2/v3 unless `docs/INTENTIONS.md` is updated first
+- Stay within v1/v2/v3/v4/v5 unless `docs/INTENTIONS.md` is updated first
 - Every Druid request is windowed and bounded (`DRUID_MAX_RANGE`, `DRUID_MAX_RPS`, `DRUID_MAX_INFLIGHT`, `DRUID_TIMEOUT`, `DRUID_RETRIES`) and one reply is capped at 64 MiB; never re-introduce an unbounded `SELECT`, a `COUNT(*)` pre-size probe or an unbounded `io.ReadAll`
 - A column the worker cannot read is never a zero: a null or unparseable `metric_value` is `NaN` and keeps its timestamp (the 1-minute check runs before the fit drops NaN), and a row it cannot place in time is dropped with a warning
 - The Kafka sink writes with `RequiredAcks: RequireAll`; a literal `kafka.Writer` would default to `RequireNone`, whose `Produce` returns `(nil, nil)`, making a broker-rejected record look published
@@ -44,14 +44,22 @@ N workers over one table by rendezvous hashing of `metric_hash` over a peer set 
 
 Train on a schedule, persist the fit, publish from the snapshot. Bounded Druid access (`DRUID_MAX_RANGE` slicing, rate/inflight caps, retry, timeout, optional static auth header), Postgres snapshot store (`baselines.snapshots`, gzip `forecast.Snapshot`), scheduled retrain with a fleet-wide `FOR UPDATE SKIP LOCKED` claim queue on `forecast.retrain`, Postgres-heartbeat membership (`baselines.workers`, `SHARD_MEMBERSHIP=store`), and a publish timestamp of minute-truncated `now` + `AHEAD_MINUTES`. The v1 span rule reaches every path that decides: a hash is scheduled, trained and published only while its scan span covers `LOOKBACK` (the schedule insert and `emit` are gated on it, and a claim below it is finished as an error rather than fitted), because the retrain path's fit is not the fit that carries the check.
 
-## v1/v2/v3 out of scope
+## v4 in scope
 
-Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka, Docker/Helm packaging (see `timeseries-k8s`), a coordinator/leader election for ownership, backfill after a restart, an HTTP endpoint or health probe, more than one shared Postgres.
+Version the schema and make every primary key this repo owns a uuid. `migrations/0001_snapshots.sql` and `0002_workers.sql` are embedded and are the only schema authority, applied by `baselines-migrate` (`cmd/migrate`, `make migrate`) before a worker starts, or optionally by the worker's first store use; the ledger is this repo's own `baselines.schema_migrations` under `pg_advisory_xact_lock`, one transaction per file. Both tables this repo owns carry `id uuid PRIMARY KEY DEFAULT gen_random_uuid()` with the natural key beside it still `UNIQUE` (`metric_hash`, and the heartbeat's identity column renamed `id` → `worker_id`); a pre-uuid table is adopted in place. `forecast.retrain` stays the plugin's table.
+
+## v5 in scope
+
+Collect the worker's own dead snapshots. `SNAPSHOT_TTL` (default `72h`, `0` disables, a positive value below `1h` is rejected) is the window after which the publisher tick deletes a `baselines.snapshots` row that nothing refreshed: its `updated_at` is older than the window **and** its `forecast.retrain` `baseline` row has no `last_run_at` inside it either (the owner-guarded `Done` writes a recent one on every finish, failure included, so an outage is not a dead metric). The sweep is one statement per tick, best effort (a failure is logged and the tick proceeds), and reads `forecast.retrain` only — that table stays the plugin's. It must exceed the retrain cadence, hence the 72h default beside the daily default cron. The plugin removes its own `forecast.snapshots` under `FORECAST_SNAPSHOT_TTL`.
+
+## v1/v2/v3/v4/v5 out of scope
+
+Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka, Docker/Helm packaging (see `timeseries-k8s`), a coordinator/leader election for ownership, backfill after a restart, an HTTP endpoint or health probe, more than one shared Postgres, a second migration tool (Flyway/goose/golang-migrate) or a schema-diff ORM, an integer surrogate key or `SERIAL`/sequence on a table this repo owns, and migrating another component's table (`forecast.retrain`).
 
 ## Workflow
 
 - Table-driven tests next to the code under test
 - Depend on tagged `timeseries` and `timeseries-forecast` modules; do not add a `replace` directive
-- `make linux` writes `bin/baselines` for the sandbox container
+- `make linux` writes `bin/baselines` for the sandbox container; `make migrate` writes `bin/baselines-migrate`, the CI/CD entry point for the schema
 - Do not copy Series internals; use the public timeseries API only
-- GitHub Actions on `main`: `gofmt` and `go test -race ./...` against a `postgres:17` service (`BASELINE_TEST_PG`)
+- GitHub Actions on `main`: `gofmt` and `go test -race ./...` against a `postgres:17` service (`BASELINE_TEST_PG`), the linux worker and migrator builds, and the migration CLI run against that service

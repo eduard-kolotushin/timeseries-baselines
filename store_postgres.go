@@ -18,29 +18,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ensureSQL is the worker's own schema. forecast.retrain is NOT created here:
-// that table belongs to the plugin, which owns its API; this process only reads,
-// claims and finishes rows in it.
-const ensureSQL = `
-CREATE SCHEMA IF NOT EXISTS baselines;
-CREATE TABLE IF NOT EXISTS baselines.snapshots (
-  metric_hash TEXT PRIMARY KEY,
-  model TEXT NOT NULL,
-  season TEXT NOT NULL,
-  calendar TEXT NOT NULL DEFAULT '',
-  lookback_ms BIGINT NOT NULL,
-  trained_at TIMESTAMPTZ NOT NULL,
-  snapshot BYTEA NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS baselines.workers (
-  id TEXT PRIMARY KEY,
-  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
-  owned INTEGER NOT NULL DEFAULT 0,
-  peers INTEGER NOT NULL DEFAULT 0
-);
-`
+// schemaMigrations is the embedded migration set, read once at startup: the
+// worker applies it at its first store use (see migrations.go), exactly as
+// cmd/migrate does out-of-process.
+var schemaMigrations = allMigrations()
 
 // ensureRetryAfter throttles reconnect attempts while Postgres is unreachable so
 // one outage does not turn every tick into a dial storm.
@@ -91,12 +72,25 @@ func (s *postgresStore) ensure(ctx context.Context) error {
 		s.lastErr = fmt.Errorf("baseline store: %w", err)
 		return s.lastErr
 	}
-	if _, err := s.pool.Exec(ctx, ensureSQL); err != nil {
+	res, err := applyMigrations(ctx, s.pool, schemaMigrations, false)
+	if err != nil {
 		// A locked-down runtime user may lack CREATE. Accept that when the tables
-		// are already provisioned.
+		// are already provisioned. The error already names the store (or the
+		// migration), so it is not wrapped again.
 		if _, probe := s.pool.Exec(ctx, `SELECT 1 FROM baselines.snapshots LIMIT 1`); probe != nil {
-			s.lastErr = fmt.Errorf("baseline store: %w", err)
+			s.lastErr = err
 			return s.lastErr
+		}
+		// The probe accepted an already-provisioned schema, but the migration
+		// itself failed: log it, so an operator can tell "the migration ran" from
+		// "the migration never applied" when only the readiness probe succeeded.
+		slog.Warn("baseline schema not applied", "err", err.Error())
+	} else {
+		if len(res.Applied) > 0 {
+			slog.Info("baseline schema migrated", "applied", res.Applied)
+		}
+		if len(res.Unknown) > 0 {
+			slog.Warn("baseline schema is newer than this binary", "versions", res.Unknown)
 		}
 	}
 	s.ready = true
@@ -192,14 +186,42 @@ func (s *postgresStore) Fresh(ctx context.Context, keys []string) (map[string]ti
 	return out, rows.Err()
 }
 
+// SweepSnapshots collects the snapshots nothing has refreshed within ttl whose
+// baseline schedule row is equally idle, and returns how many were deleted. It
+// is the worker's own garbage collection: baselines.snapshots is written only
+// here, so a metric that stopped reporting leaves a model that no retrain and no
+// other writer moves updated_at for, and its forecast.retrain row has no recent
+// last_run_at either (the owner-guarded Done writes one on every finish,
+// including a failed one, so a transient Druid or Grafana outage is never
+// mistaken for a dead metric). A row an admin deleted leaves no row at all,
+// which is also idle. forecast.retrain is only read here: the table is created
+// and owned by the plugin.
+func (s *postgresStore) SweepSnapshots(ctx context.Context, ttl time.Duration) (int64, error) {
+	if err := s.ensure(ctx); err != nil {
+		return 0, err
+	}
+	tag, err := s.pool.Exec(ctx, `
+DELETE FROM baselines.snapshots s
+WHERE s.updated_at < now() - $1::interval
+  AND NOT EXISTS (
+    SELECT 1 FROM forecast.retrain r
+    WHERE r.scope = 'baseline' AND r.key = s.metric_hash
+      AND r.last_run_at > now() - $1::interval)
+`, ttl)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (s *postgresStore) Heartbeat(ctx context.Context, id string, owned, peers int) error {
 	if err := s.ensure(ctx); err != nil {
 		return err
 	}
 	_, err := s.pool.Exec(ctx, `
-INSERT INTO baselines.workers (id, last_seen, owned, peers)
+INSERT INTO baselines.workers (worker_id, last_seen, owned, peers)
 VALUES ($1, now(), $2, $3)
-ON CONFLICT (id) DO UPDATE SET
+ON CONFLICT (worker_id) DO UPDATE SET
   last_seen = now(),
   owned = EXCLUDED.owned,
   peers = EXCLUDED.peers
@@ -211,7 +233,7 @@ func (s *postgresStore) Peers(ctx context.Context, ttl time.Duration) ([]string,
 	if err := s.ensure(ctx); err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT id FROM baselines.workers WHERE last_seen > now() - $1::interval ORDER BY id`, ttl)
+	rows, err := s.pool.Query(ctx, `SELECT worker_id FROM baselines.workers WHERE last_seen > now() - $1::interval ORDER BY worker_id`, ttl)
 	if err != nil {
 		return nil, err
 	}

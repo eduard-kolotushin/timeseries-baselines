@@ -30,6 +30,10 @@ const (
 	defaultWorkerTTL        = 30 * time.Second
 	defaultRetrainCron      = "0 3 * * *"
 	defaultRetrainRetry     = 5 * time.Minute
+
+	// defaultSnapshotTTL is three daily retrain cycles, so a healthy metric is
+	// never collected by the sweep while a metric that stopped reporting is.
+	defaultSnapshotTTL = 72 * time.Hour
 )
 
 var datasourceName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
@@ -79,6 +83,14 @@ type Config struct {
 	// the process stateless, refitting every tick and sharding statically.
 	StoreDSN string
 
+	// SnapshotTTL is how long a baselines.snapshots row may go unrefreshed
+	// before the tick's sweep collects it, provided its forecast.retrain row is
+	// idle too. 0 disables the sweep; a positive value below 1h is rejected.
+	// ConfigFromEnv defaults it to 72h and an explicit SNAPSHOT_TTL=0 stays 0;
+	// normalized leaves the field alone because 0 is the off switch, so a Config
+	// built in code carries whatever the caller set.
+	SnapshotTTL time.Duration
+
 	// Sharding. Empty ShardPeers and ShardDNS mean one worker owns every hash.
 	// ShardID defaults to the first non-loopback IP (ShardID in shard.go).
 	// ShardMembership selects the source: auto resolves to peers, dns, store or
@@ -92,7 +104,7 @@ type Config struct {
 }
 
 // ConfigFromEnv reads DRUID_*, KAFKA_*, LOOKBACK, AHEAD_MINUTES, INTERVAL,
-// CALENDAR, SHARD_*, LOG_LEVEL and the BASELINE_STORE_* DSN.
+// CALENDAR, SHARD_*, LOG_LEVEL, SNAPSHOT_TTL and the BASELINE_STORE_* DSN.
 func ConfigFromEnv() (Config, error) {
 	cfg := Config{
 		DruidBroker:        strings.TrimSpace(os.Getenv("DRUID_BROKER")),
@@ -120,6 +132,7 @@ func ConfigFromEnv() (Config, error) {
 		ShardMembership:    strings.TrimSpace(os.Getenv("SHARD_MEMBERSHIP")),
 		LogLevel:           "info",
 		StoreDSN:           storeDSN(os.Getenv),
+		SnapshotTTL:        defaultSnapshotTTL,
 	}
 	if cfg.DruidDatasource == "" {
 		cfg.DruidDatasource = defaultDatasource
@@ -147,6 +160,7 @@ func ConfigFromEnv() (Config, error) {
 		{"SNAPSHOT_CACHE_TTL", &cfg.SnapshotCacheTTL},
 		{"WORKER_TTL", &cfg.WorkerTTL},
 		{"RETRAIN_RETRY", &cfg.RetrainRetry},
+		{"SNAPSHOT_TTL", &cfg.SnapshotTTL},
 	}
 	for _, d := range durations {
 		v, ok, err := envDuration(d.name)
@@ -252,6 +266,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("DEFAULT_RETRAIN_CRON: %w", err)
 		}
 	}
+	if c.SnapshotTTL > 0 && c.SnapshotTTL < time.Hour {
+		// A window shorter than the retrain cadence would collect a snapshot a
+		// healthy metric is still being refreshed into; 0 is the explicit "off".
+		return fmt.Errorf("SNAPSHOT_TTL must be at least 1h (or 0 to disable the sweep)")
+	}
 	if c.LogLevel != "" && c.LogLevel != "info" && c.LogLevel != "debug" {
 		return fmt.Errorf("LOG_LEVEL must be info or debug")
 	}
@@ -279,9 +298,11 @@ func (c Config) SlogLevel() slog.Level {
 }
 
 // normalized fills the fields where an unset value has a default, so a Config
-// built in code behaves like one read from the environment. Fields where zero is
-// a real setting (DRUID_MAX_RANGE, DRUID_RETRIES, DRUID_MAX_RPS, LOG_LEVEL) are
-// left alone.
+// built in code behaves like one read from the environment — except the fields
+// where zero is a real setting (DRUID_MAX_RANGE, DRUID_RETRIES, DRUID_MAX_RPS,
+// LOG_LEVEL, SNAPSHOT_TTL), which are left alone: for those, ConfigFromEnv is
+// what supplies the deployed default, and SNAPSHOT_TTL = 0 keeps meaning "off"
+// however the Config was built.
 func (c Config) normalized() Config {
 	if c.DruidTimeout <= 0 {
 		c.DruidTimeout = defaultDruidTimeout

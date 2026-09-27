@@ -34,3 +34,18 @@ jobs:
         run: test -z "$(gofmt -l .)"
       - name: Test
         run: go test -race ./...
+      - name: Build the linux binaries
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/baselines ./cmd/baselines
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /tmp/baselines-migrate ./cmd/migrate
+      # The migration CLI is what a CD pipeline runs before the worker starts. The
+      # pg-gated Go tests already cover the from-scratch, legacy-schema and
+      # concurrency paths; this proves the binary's own DSN chain and exit code
+      # against a real Postgres, and that re-running is a no-op.
+      - name: Migration CLI
+        env:
+          BASELINE_STORE_URL: ${{ env.BASELINE_TEST_PG }}
+        run: |
+          go run ./cmd/migrate
+          go run ./cmd/migrate | grep -q "nothing to apply"
+          go run ./cmd/migrate --dry-run | grep -q "nothing to apply"

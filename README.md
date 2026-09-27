@@ -16,6 +16,7 @@ Depends on tagged `timeseries` and `timeseries-forecast` modules.
 ```bash
 make test    # go test ./...
 make linux   # Linux amd64 binary -> bin/baselines (sandbox mount)
+make migrate # Linux amd64 migration CLI -> bin/baselines-migrate (CI/CD)
 ```
 
 The sandbox Compose service `baseline-worker` mounts that binary and sets `DRUID_BROKER`, `KAFKA_BROKERS`, and related env. Running the process is what enables the ticker.
@@ -42,9 +43,12 @@ Ingestion must be duplicate-tolerant — the reference Druid supervisor uses `do
 
 With `BASELINE_STORE_*` (or `FORECAST_STORE_*`) pointing at Postgres, the worker stops fitting every tick:
 
+- The schema is versioned: `migrations/*.sql` is embedded and applied by `baselines-migrate` (`make migrate`) before a worker starts, or by the worker itself at its first store use. The ledger is `baselines.schema_migrations`, one transaction per file under an advisory lock.
+- Every table this repo owns is keyed by a database-generated uuid `id` (`baselines.snapshots`, `baselines.workers`), with its natural key — `metric_hash`, `worker_id` — still `UNIQUE`. A table from before that change is adopted in place, rows and all.
 - A retrain loads the last `LOOKBACK`, fits, and writes a gzip `forecast.Snapshot` to `baselines.snapshots`.
 - Every tick publishes from the cached snapshot at minute-truncated `now` + `AHEAD_MINUTES`, so **publishing costs zero Druid requests** and survives a Druid outage.
 - Retrains are scheduled per hash in `forecast.retrain` (cron, default `0 3 * * *`) and claimed fleet-wide with `FOR UPDATE SKIP LOCKED`, so any worker retrains any hash and a failed retrain is due again after `RETRAIN_RETRY` (default 5m).
+- The tick sweeps its own dead snapshots: a `baselines.snapshots` row nothing refreshed within `SNAPSHOT_TTL` (default 72h; `0` disables) whose `forecast.retrain` row is idle too is deleted, so a retired metric does not keep its model forever.
 - The Druid scan is windowed too, and cached for `HASH_SCAN_TTL` (default 5m).
 
 Without a store the worker keeps the v1/v2 loop: fit and publish every tick, one Druid request per owned hash per tick. Both modes bound every request with `DRUID_MAX_RANGE` / `DRUID_MAX_RPS` / `DRUID_MAX_INFLIGHT` / `DRUID_TIMEOUT` / `DRUID_RETRIES`; the full env table is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).

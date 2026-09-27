@@ -170,6 +170,7 @@ func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 	owned := ownedSpans(spans, p.peers.self, peers)
 	keys := ownedKeys(spans, owned)
 	p.heartbeat(ctx, len(keys), len(peers))
+	p.sweep(ctx)
 	ready := readyKeys(spans, owned, p.cfg.Lookback)
 	res := tickResult{
 		peers:      len(peers),
@@ -219,6 +220,25 @@ func (p *Publisher) heartbeat(ctx context.Context, owned, peers int) {
 		return
 	}
 	p.hbWarned = false
+}
+
+// sweep collects the snapshots nothing refreshed within SnapshotTTL whose
+// baseline row is idle too. It runs once per tick and is best effort: a failure
+// is logged and the rest of the tick proceeds, because retention is housekeeping
+// and must never cost a publish. 0 disables it, and with no store there is
+// nothing to collect.
+func (p *Publisher) sweep(ctx context.Context) {
+	if p.store == nil || p.cfg.SnapshotTTL <= 0 {
+		return
+	}
+	n, err := p.store.SweepSnapshots(ctx, p.cfg.SnapshotTTL)
+	if err != nil {
+		slog.Warn("baseline snapshot sweep", "err", err)
+		return
+	}
+	if n > 0 {
+		slog.Debug("baseline snapshots collected", "count", n)
+	}
 }
 
 // retrain schedules every owned hash that is eligible and has no row yet, then
@@ -362,6 +382,10 @@ func (p *Publisher) fitHash(ctx context.Context, key string, now time.Time) erro
 // retrain that runs across a minute boundary must publish that minute, not skip
 // it.
 func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string, owned []bool, now time.Time) int {
+	// Per-hash state is pruned here rather than inside refreshSnapshots, which
+	// returns immediately without a store: the publish marks and warning flags of
+	// a hash this worker no longer owns must be released in both modes.
+	p.pruneFits(keys)
 	p.refreshSnapshots(ctx, keys, now)
 	ts := now.Truncate(time.Minute).Add(time.Duration(p.cfg.AheadMinutes) * time.Minute)
 	published := 0
@@ -493,14 +517,12 @@ func (p *Publisher) publish(ctx context.Context, key string, at time.Time, value
 // A failed freshness query keeps the cached fits: publishing must survive a
 // store hiccup, because the models it needs are already in memory.
 //
-// Every call also drops the fits this worker no longer owns, before the cache
-// TTL can short-circuit the query: a hash that moved to another peer would
-// otherwise keep ~0.5 MB of fitted state on this process for its whole life.
+// Pruning the fits this worker no longer owns is not done here but in emit, so it
+// also runs without a store.
 func (p *Publisher) refreshSnapshots(ctx context.Context, keys []string, now time.Time) {
 	if p.store == nil {
 		return
 	}
-	p.pruneFits(keys)
 	if len(keys) == 0 {
 		return
 	}
@@ -541,13 +563,13 @@ func (p *Publisher) refreshSnapshots(ctx context.Context, keys []string, now tim
 	}
 }
 
-// pruneFits drops the fits and warning state of every hash this worker no longer
-// owns, so a hash that moved to another peer releases its fitted state instead of
-// pinning it for the life of the process.
+// pruneFits drops the per-hash state of every hash this worker no longer owns:
+// the restored fit (~0.5 MB), the once-per-streak warning mark and the publish
+// mark. A hash that moved to another peer releases all three instead of pinning
+// them for the life of the process. emit calls it once per tick in both modes —
+// with no store there is no fitted state, but the marks still grow with the
+// number of hashes the worker has ever seen.
 func (p *Publisher) pruneFits(keys []string) {
-	if len(p.fitted) == 0 {
-		return
-	}
 	if p.ownedSet == nil {
 		p.ownedSet = make(map[string]struct{}, len(keys))
 	}
@@ -556,11 +578,19 @@ func (p *Publisher) pruneFits(keys []string) {
 		p.ownedSet[key] = struct{}{}
 	}
 	for key := range p.fitted {
-		if _, ok := p.ownedSet[key]; ok {
-			continue
+		if _, ok := p.ownedSet[key]; !ok {
+			delete(p.fitted, key)
 		}
-		delete(p.fitted, key)
-		delete(p.warned, key)
+	}
+	for key := range p.warned {
+		if _, ok := p.ownedSet[key]; !ok {
+			delete(p.warned, key)
+		}
+	}
+	for key := range p.published {
+		if _, ok := p.ownedSet[key]; !ok {
+			delete(p.published, key)
+		}
 	}
 }
 

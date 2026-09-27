@@ -12,15 +12,17 @@ SHELL := $(GIT_SH)
 endif
 endif
 
-.PHONY: all test linux help
+.PHONY: all test linux migrate help
 
 BIN := bin/baselines
+BIN_MIGRATE := bin/baselines-migrate
 
 all: test
 
 help:
-	@echo "make test   go test ./..."
-	@echo "make linux  Linux amd64 binary -> bin/baselines"
+	@echo "make test     go test ./..."
+	@echo "make linux    Linux amd64 binary -> bin/baselines"
+	@echo "make migrate  Linux amd64 migration CLI -> bin/baselines-migrate"
 
 test:
 	go test ./...
@@ -31,3 +33,10 @@ test:
 linux:
 	mkdir -p "bin"
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$(BIN)" ./cmd/baselines
+
+# CI/CD entry point: applies the embedded migrations (migrations/) to a database
+# before the worker starts, so a pipeline can prepare the schema instead of relying
+# on the worker's first store use. Optional: the worker applies the same set.
+migrate:
+	mkdir -p "bin"
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$(BIN_MIGRATE)" ./cmd/migrate

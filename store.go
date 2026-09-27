@@ -16,11 +16,13 @@ const (
 
 // snapshotStore keeps the fitted models. Fresh answers which of keys have moved
 // since the caller last looked, so the publish path restores only what changed
-// instead of every snapshot on every tick.
+// instead of every snapshot on every tick. SweepSnapshots collects the ones that
+// stopped moving, so a retired metric does not keep its model forever.
 type snapshotStore interface {
 	Fresh(ctx context.Context, keys []string) (map[string]time.Time, error)
 	Get(ctx context.Context, key string) (forecast.Snapshot, bool, error)
 	Put(ctx context.Context, key string, rec snapshotRecord, snap forecast.Snapshot) error
+	SweepSnapshots(ctx context.Context, ttl time.Duration) (int64, error)
 }
 
 // retrainQueue distributes scheduled retrains. Claims are fleet-wide and not
