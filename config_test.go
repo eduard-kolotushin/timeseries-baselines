@@ -248,8 +248,15 @@ func TestConfigValidate(t *testing.T) {
 		{"retrain cron", func(c *Config) { c.DefaultRetrainCron = "every night" }, "DEFAULT_RETRAIN_CRON"},
 		{"retrain cron as a descriptor", func(c *Config) { c.DefaultRetrainCron = "@daily" }, ""},
 		{"snapshot ttl below an hour", func(c *Config) { c.SnapshotTTL = 30 * time.Minute }, "SNAPSHOT_TTL"},
-		{"snapshot ttl at an hour", func(c *Config) { c.SnapshotTTL = time.Hour }, ""},
-		{"snapshot ttl disabled", func(c *Config) { c.SnapshotTTL = 0 }, ""},
+		{"snapshot ttl at an hour under a five-minute cadence", func(c *Config) {
+			c.DefaultRetrainCron = "*/5 * * * *"
+			c.SnapshotTTL = time.Hour
+		}, ""},
+		{"snapshot ttl below the daily retrain cadence", func(c *Config) {
+			c.SnapshotTTL = time.Hour
+		}, "SNAPSHOT_TTL"},
+		{"snapshot ttl above the daily retrain cadence", func(c *Config) { c.SnapshotTTL = 72 * time.Hour }, ""},
+		{"snapshot ttl disabled under a daily cadence", func(c *Config) { c.SnapshotTTL = 0 }, ""},
 		{"log level", func(c *Config) { c.LogLevel = "trace" }, "LOG_LEVEL"},
 		{"membership mode", func(c *Config) { c.ShardMembership = "etcd" }, "SHARD_MEMBERSHIP"},
 		{"store membership without a store", func(c *Config) { c.ShardMembership = "store" }, "SHARD_MEMBERSHIP=store"},

@@ -74,10 +74,13 @@ func (s *postgresStore) ensure(ctx context.Context) error {
 	}
 	res, err := applyMigrations(ctx, s.pool, schemaMigrations, false)
 	if err != nil {
-		// A locked-down runtime user may lack CREATE. Accept that when the tables
-		// are already provisioned. The error already names the store (or the
-		// migration), so it is not wrapped again.
-		if _, probe := s.pool.Exec(ctx, `SELECT 1 FROM baselines.snapshots LIMIT 1`); probe != nil {
+		// A locked-down runtime user may lack CREATE. Accept that when every table
+		// this binary reads is already provisioned — all of them, because the schema
+		// now arrives as independent files: probing one would accept a database where
+		// 0002 never applied, and every Heartbeat/Peers would then fail with 42703
+		// against the legacy shape while the store reported itself ready. The error
+		// already names the store (or the migration), so it is not wrapped again.
+		if probeErr := s.probeSchema(ctx); probeErr != nil {
 			s.lastErr = err
 			return s.lastErr
 		}
@@ -193,9 +196,11 @@ func (s *postgresStore) Fresh(ctx context.Context, keys []string) (map[string]ti
 // other writer moves updated_at for, and its forecast.retrain row has no recent
 // last_run_at either (the owner-guarded Done writes one on every finish,
 // including a failed one, so a transient Druid or Grafana outage is never
-// mistaken for a dead metric). A row an admin deleted leaves no row at all,
-// which is also idle. forecast.retrain is only read here: the table is created
-// and owned by the plugin.
+// mistaken for a dead metric). The row it looks up is the fleet-wide baseline row
+// (org_id = 0, the only org this key space uses), so a row another component
+// happened to write under a different org cannot pin a snapshot forever. A row an
+// admin deleted leaves no row at all, which is also idle. forecast.retrain is only
+// read here: the table is created and owned by the plugin.
 func (s *postgresStore) SweepSnapshots(ctx context.Context, ttl time.Duration) (int64, error) {
 	if err := s.ensure(ctx); err != nil {
 		return 0, err
@@ -205,13 +210,30 @@ DELETE FROM baselines.snapshots s
 WHERE s.updated_at < now() - $1::interval
   AND NOT EXISTS (
     SELECT 1 FROM forecast.retrain r
-    WHERE r.scope = 'baseline' AND r.key = s.metric_hash
+    WHERE r.scope = 'baseline' AND r.org_id = 0 AND r.key = s.metric_hash
       AND r.last_run_at > now() - $1::interval)
 `, ttl)
 	if err != nil {
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// probeSchema reads one row from each table this worker needs, naming the columns the
+// migrations define, so a database whose files only partly applied is not mistaken for
+// a provisioned one: a legacy workers table (no uuid id, no worker_id) fails here while
+// the store is still reporting the migration error, instead of latching ready and
+// failing every Heartbeat/Peers with 42703. LIMIT 1 keeps it free on an empty table.
+func (s *postgresStore) probeSchema(ctx context.Context) error {
+	for _, q := range []string{
+		`SELECT id, metric_hash FROM baselines.snapshots LIMIT 1`,
+		`SELECT id, worker_id FROM baselines.workers LIMIT 1`,
+	} {
+		if _, err := s.pool.Exec(ctx, q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *postgresStore) Heartbeat(ctx context.Context, id string, owned, peers int) error {

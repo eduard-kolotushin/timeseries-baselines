@@ -262,8 +262,21 @@ func (c Config) Validate() error {
 		return fmt.Errorf("WORKER_TTL must be longer than INTERVAL")
 	}
 	if c.DefaultRetrainCron != "" {
-		if _, err := cronv3.ParseStandard(c.DefaultRetrainCron); err != nil {
+		sched, err := cronv3.ParseStandard(c.DefaultRetrainCron)
+		if err != nil {
 			return fmt.Errorf("DEFAULT_RETRAIN_CRON: %w", err)
+		}
+		if c.SnapshotTTL > 0 {
+			// The window has to outlast the gap between two firings of the configured
+			// cron. A shorter one collects a healthy metric's snapshot before the next
+			// retrain refreshes it, and the publisher then has nothing to publish from
+			// until that retrain — a silent outage that the 1h floor above does not
+			// catch (a daily cron with a 1h window passes it). Judged by the gap the
+			// cron actually has next, so an irregular cron is measured as it runs.
+			next := sched.Next(time.Now())
+			if gap := sched.Next(next).Sub(next); c.SnapshotTTL <= gap {
+				return fmt.Errorf("SNAPSHOT_TTL (%s) must be longer than the DEFAULT_RETRAIN_CRON gap (%s)", c.SnapshotTTL, gap)
+			}
 		}
 	}
 	if c.SnapshotTTL > 0 && c.SnapshotTTL < time.Hour {

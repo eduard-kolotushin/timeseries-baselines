@@ -63,6 +63,38 @@ func openTestStore(t *testing.T) (*postgresStore, context.Context) {
 	return s, ctx
 }
 
+// TestProbeSchemaChecksEveryTable: the readiness fallback runs when the migration could
+// not be applied, and the schema arrives as independent files — so accepting one table
+// would let a database whose 0002 never applied count as provisioned, after which every
+// Heartbeat/Peers fails with 42703 (a legacy workers table has no worker_id) while the
+// store reports itself ready.
+func TestProbeSchemaChecksEveryTable(t *testing.T) {
+	s, ctx := openTestStore(t)
+	const worker = "baselines-probe-shape"
+	if err := s.Heartbeat(ctx, worker, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM baselines.workers WHERE worker_id = $1`, worker)
+	})
+	if err := s.probeSchema(ctx); err != nil {
+		t.Fatalf("the migrated schema must pass the shape probe: %v", err)
+	}
+
+	// Renaming the identity column away is what a table from before 0002 looks like:
+	// the probe must refuse it, so ensure keeps reporting the migration error instead
+	// of latching ready.
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE baselines.workers RENAME COLUMN worker_id TO legacy_id`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `ALTER TABLE baselines.workers RENAME COLUMN legacy_id TO worker_id`)
+	})
+	if err := s.probeSchema(ctx); err == nil {
+		t.Fatal("the shape probe accepted a workers table without worker_id")
+	}
+}
+
 func TestPostgresSnapshotStore(t *testing.T) {
 	s, ctx := openTestStore(t)
 	const key = "baselines-store-test"
@@ -495,11 +527,12 @@ func TestPostgresSweepSnapshots(t *testing.T) {
 	s, ctx := openTestStore(t)
 	ensurePluginRetrainTable(t, s)
 	const (
-		staleIdle = "baselines-sweep-stale-idle"
-		staleBusy = "baselines-sweep-stale-busy"
-		fresh     = "baselines-sweep-fresh"
+		staleIdle     = "baselines-sweep-stale-idle"
+		staleBusy     = "baselines-sweep-stale-busy"
+		fresh         = "baselines-sweep-fresh"
+		staleOtherOrg = "baselines-sweep-stale-otherorg"
 	)
-	keys := []string{staleIdle, staleBusy, fresh}
+	keys := []string{staleIdle, staleBusy, fresh, staleOtherOrg}
 	t.Cleanup(func() {
 		_, _ = s.pool.Exec(context.Background(), `DELETE FROM baselines.snapshots WHERE metric_hash = ANY($1)`, keys)
 		_, _ = s.pool.Exec(context.Background(), `DELETE FROM forecast.retrain WHERE scope = 'baseline' AND key = ANY($1)`, keys)
@@ -537,6 +570,17 @@ ON CONFLICT (scope, org_id, key) DO UPDATE SET last_run_at = EXCLUDED.last_run_a
 	// writers, which still counts as fresh.
 	seedSnapshot(fresh, 0)
 	seedRow(fresh, stale)
+	// Stale snapshot, and a same-key `baseline` row under another org with a recent
+	// finish: baseline rows are the fleet-wide org 0, so the correlation is scoped to
+	// it and this row cannot pin the snapshot.
+	seedSnapshot(staleOtherOrg, stale)
+	if _, err := s.pool.Exec(ctx, `
+INSERT INTO forecast.retrain (scope, org_id, key, cron, timezone, enabled, next_run_at, last_run_at)
+VALUES ('baseline', 7, $1, '0 3 * * *', 'UTC', true, now() + interval '1 hour', now())
+ON CONFLICT (scope, org_id, key) DO UPDATE SET last_run_at = EXCLUDED.last_run_at, superseded_at = NULL
+`, staleOtherOrg); err != nil {
+		t.Fatal(err)
+	}
 
 	n, err := s.SweepSnapshots(ctx, time.Hour)
 	if err != nil {
@@ -550,7 +594,7 @@ ON CONFLICT (scope, org_id, key) DO UPDATE SET last_run_at = EXCLUDED.last_run_a
 		t.Fatal(err)
 	}
 	if count != 2 {
-		t.Fatalf("kept %d of the three seeded snapshots, want 2", count)
+		t.Fatalf("kept %d of the four seeded snapshots, want 2", count)
 	}
 	for _, tc := range []struct {
 		key  string
@@ -559,6 +603,7 @@ ON CONFLICT (scope, org_id, key) DO UPDATE SET last_run_at = EXCLUDED.last_run_a
 		{staleIdle, false},
 		{staleBusy, true},
 		{fresh, true},
+		{staleOtherOrg, false},
 	} {
 		var exists bool
 		if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM baselines.snapshots WHERE metric_hash = $1)`, tc.key).Scan(&exists); err != nil {
