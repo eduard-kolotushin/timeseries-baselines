@@ -642,10 +642,12 @@ UPDATE forecast.retrain SET next_run_at = now() - interval '10 years'
 WHERE scope = 'baseline' AND key = $1`, key); err != nil {
 		t.Fatal(err)
 	}
-	// The claim is fleet-wide, so another test's rows can come back with it; only this
-	// row is of interest.
+	// The claim is fleet-wide, so a database that holds other rows (the sandbox's own
+	// hashes, say) could hand them back too. The row this test seeded is backdated ten
+	// years, so it is first in the ORDER BY and limit 1 keeps the test off rows it did
+	// not create — and off their leases.
 	claim := func(owner string) *retrainClaim {
-		claims, err := s.Claim(ctx, owner, time.Minute, 100)
+		claims, err := s.Claim(ctx, owner, time.Minute, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -723,13 +725,20 @@ WHERE scope = 'baseline' AND key = $1`, key).Scan(&status, &dueAt, &attempts); e
 
 // TestMissingAttemptsError: the attempts column belongs to the plugin's table, so a
 // database that has not had the plugin's 0003 migration applied must be named, not
-// surface a bare undefined-column error on every tick. Every other error passes
-// through untouched, because only this one has a remedy worth naming.
+// surface a bare undefined-column error on every tick. The live shape is the one that
+// matters: PostgreSQL 17 answers `column r.attempts does not exist` with an *empty*
+// PgError.ColumnName when the statement qualifies the column (measured against the
+// Compose database), so a matcher keyed on that field alone never fires. Every other
+// error passes through untouched, because only this one has a remedy worth naming.
 func TestMissingAttemptsError(t *testing.T) {
 	t.Parallel()
-	named := missingAttemptsError(&pgconn.PgError{Code: "42703", ColumnName: "attempts", Message: `column "attempts" does not exist`})
-	if !strings.Contains(named.Error(), "gpx_forecast_migrate") {
-		t.Fatalf("err=%v, want the remedy named", named)
+	qualified := &pgconn.PgError{Code: "42703", ColumnName: "", Message: "column r.attempts does not exist"}
+	if got := missingAttemptsError(qualified); !strings.Contains(got.Error(), "gpx_forecast_migrate") {
+		t.Fatalf("err=%v, want the qualified-column shape to name the remedy", got)
+	}
+	quoted := &pgconn.PgError{Code: "42703", ColumnName: "attempts", Message: `column "attempts" does not exist`}
+	if got := missingAttemptsError(quoted); !strings.Contains(got.Error(), "gpx_forecast_migrate") {
+		t.Fatalf("err=%v, want the unqualified shape to name the remedy", got)
 	}
 	other := &pgconn.PgError{Code: "42703", ColumnName: "superseded_at", Message: `column "superseded_at" does not exist`}
 	if got := missingAttemptsError(other); got != error(other) {

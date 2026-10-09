@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -423,13 +424,19 @@ WHERE scope = 'baseline' AND org_id = $3 AND key = $1 AND claimed_by = $2
 
 // missingAttemptsError names the one condition a forecast.retrain table from before
 // the plugin's attempts migration produces for a claim, an extend or a finish:
-// Postgres 42703 with ColumnName "attempts". Every tick would otherwise report one
+// Postgres 42703 on the attempts column. Every tick would otherwise report one
 // generic undefined-column error and no row would ever be claimed, so the remedy the
 // operator can apply is named once instead. The column is the plugin's table's, so
 // this process never adds it.
+//
+// The match is on the message, not only on PgError.ColumnName: PostgreSQL leaves
+// `columnname` empty when the statement qualifies the column (`column r.attempts
+// does not exist` measured against postgres:17), so a matcher that trusted the field
+// alone would never fire — which is exactly the raw 42703 this function exists to
+// replace.
 func missingAttemptsError(err error) error {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "42703" && pgErr.ColumnName == "attempts" {
+	if errors.As(err, &pgErr) && pgErr.Code == "42703" && strings.Contains(pgErr.Message, "attempts") {
 		return fmt.Errorf("forecast.retrain has no attempts column: apply the timeseries-grafana migration (gpx_forecast_migrate) before starting this worker: %w", err)
 	}
 	return err
