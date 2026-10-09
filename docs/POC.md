@@ -24,6 +24,29 @@ Behaviour described here: worker `052c1a8`, chart value `baselines.replicas`.
 >   the `baselines.workers` rows seen within `WORKER_TTL` (default `max(30s, 2*INTERVAL)`), so join/leave needs no list edit.
 > - `SHARD_PEERS` / `SHARD_DNS` still behave exactly as described below, including the negative controls.
 
+> **v4–v6 updates.** Ownership, eligibility and the publish path below are unchanged — these change the
+> bookkeeping around them, so every check still holds.
+>
+> - **v4 — the schema is versioned.** `migrations/0001_snapshots.sql` and `0002_workers.sql` are the only
+>   schema authority, applied by `baselines-migrate` before a worker starts (or, optionally, at its first store
+>   use) with the ledger `baselines.schema_migrations` under `pg_advisory_xact_lock`, one transaction per file.
+>   Both tables this repo owns carry an added `id uuid PRIMARY KEY DEFAULT gen_random_uuid()` with the natural
+>   key still `UNIQUE` beside it, and the heartbeat's identity column is `worker_id` — a pre-uuid table is
+>   adopted in place. `forecast.retrain` stays the plugin's table.
+> - **v5 — the tick collects its own dead snapshots.** A `baselines.snapshots` row that nothing refreshed
+>   within `SNAPSHOT_TTL` (default `72h`, `0` disables, a positive value below `1h` is refused) is deleted on
+>   the publisher tick — "nothing refreshed" meaning its `updated_at` is older than the window **and** its
+>   `forecast.retrain` `baseline` row has no `last_run_at` inside it either, so an outage is not a dead metric.
+>   It must therefore exceed the retrain cadence, which `Validate` enforces at startup against
+>   `DEFAULT_RETRAIN_CRON`.
+> - **v6 — a claim is a lease that covers the work, and a failure is remembered.** The claim carries
+>   `RETRAIN_LEASE` (`0` derives it from the work), it is held across the fit rather than merely around the
+>   claim, and the owner hands its claims back on shutdown instead of leaving them to expire. A failed row
+>   persists its attempt count and is due again after `min(lease × 2^(attempts−1), RETRAIN_RETRY_MAX)`, so a
+>   permanently broken row settles at one retry per cap instead of one per lease, with the count visible in
+>   `last_status`. The claim carries the row's org (`0` for a `baseline` row, so `Done` addresses the full
+>   key), and the finish predicate is `claimed_by = self` with no `IS NULL` escape.
+
 ## What this POC proves
 
 | Claim | How it is checked here |
