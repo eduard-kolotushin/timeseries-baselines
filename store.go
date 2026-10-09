@@ -32,11 +32,17 @@ type snapshotStore interface {
 // Schedule takes the whole owned set at once: one statement per tick instead of
 // one round trip per hash. Done carries the owner of the claim it finishes,
 // because a lease that expired mid-retrain can hand the row to another worker,
-// whose schedule a stale finish must not overwrite.
+// whose schedule a stale finish must not overwrite — and it carries the row's
+// consecutive-failure count, which drives the retry backoff.
+//
+// Extend pushes a held claim's lease out and reports whether the caller still owns
+// it. A false answer is not an error: another worker took the row, and the caller
+// must skip it rather than fit a row it no longer owns.
 type retrainQueue interface {
 	Schedule(ctx context.Context, keys []string, cron, tz string) error
 	Claim(ctx context.Context, owner string, lease time.Duration, limit int) ([]retrainClaim, error)
-	Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string) error
+	Extend(ctx context.Context, owner string, orgID int64, key string, lease time.Duration) (bool, error)
+	Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string, attempts int) error
 }
 
 // membership is the Postgres heartbeat that replaces static peer discovery on
@@ -73,4 +79,8 @@ type retrainClaim struct {
 	Key      string
 	Cron     string
 	Timezone string
+	// Attempts is how many consecutive retrains of this row have failed: 0 for a
+	// row that has never failed, reset by a success. The worker increments it on a
+	// failure and spaces the retry by it (see retryDelay).
+	Attempts int
 }

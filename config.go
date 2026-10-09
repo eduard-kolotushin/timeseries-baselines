@@ -30,6 +30,13 @@ const (
 	defaultWorkerTTL        = 30 * time.Second
 	defaultRetrainCron      = "0 3 * * *"
 	defaultRetrainRetry     = 5 * time.Minute
+	// defaultRetrainRetryMax caps the exponential retry backoff: a failed retrain
+	// is due again after RETRAIN_RETRY*2^(attempts-1), clamped here. Without a cap a
+	// hash that cannot be fitted — a datasource that no longer answers, a series
+	// whose history was truncated — would be retried at the base delay forever, and
+	// one overload that failed many rows at once would re-enqueue all of them on the
+	// same cadence, competing with the legitimate backlog instead of backing off.
+	defaultRetrainRetryMax = time.Hour
 
 	// defaultSnapshotTTL is three daily retrain cycles, so a healthy metric is
 	// never collected by the sweep while a metric that stopped reporting is.
@@ -69,13 +76,18 @@ type Config struct {
 	ScanRange   time.Duration
 
 	// TrainConcurrency is the retrain claim limit and the number of fits in
-	// flight. SnapshotCacheTTL throttles the per-tick snapshot freshness query;
-	// RetrainRetry is both the claim lease and the delay before a failed retrain
-	// is due again. DefaultRetrainCron is the cron a hash is scheduled with the
-	// first time it is seen.
+	// flight. SnapshotCacheTTL throttles the per-tick snapshot freshness query.
+	// RetrainRetry is the base delay before a failed retrain is due again — and the
+	// floor of the claim lease, not the lease itself: that is RetrainLease, derived
+	// from the work one claim covers (see workLease) because a single fit is many
+	// sequential Druid requests and could otherwise outlive its claim and be
+	// retrained twice at once. RetrainRetryMax caps the backoff; DefaultRetrainCron
+	// is the cron a hash is scheduled with the first time it is seen.
 	TrainConcurrency   int
 	SnapshotCacheTTL   time.Duration
 	RetrainRetry       time.Duration
+	RetrainLease       time.Duration
+	RetrainRetryMax    time.Duration
 	WorkerTTL          time.Duration
 	DefaultRetrainCron string
 
@@ -104,7 +116,8 @@ type Config struct {
 }
 
 // ConfigFromEnv reads DRUID_*, KAFKA_*, LOOKBACK, AHEAD_MINUTES, INTERVAL,
-// CALENDAR, SHARD_*, LOG_LEVEL, SNAPSHOT_TTL and the BASELINE_STORE_* DSN.
+// CALENDAR, SHARD_*, LOG_LEVEL, SNAPSHOT_TTL, RETRAIN_* (the retry base, the work
+// lease and the retry cap) and the BASELINE_STORE_* DSN.
 func ConfigFromEnv() (Config, error) {
 	cfg := Config{
 		DruidBroker:        strings.TrimSpace(os.Getenv("DRUID_BROKER")),
@@ -160,6 +173,8 @@ func ConfigFromEnv() (Config, error) {
 		{"SNAPSHOT_CACHE_TTL", &cfg.SnapshotCacheTTL},
 		{"WORKER_TTL", &cfg.WorkerTTL},
 		{"RETRAIN_RETRY", &cfg.RetrainRetry},
+		{"RETRAIN_LEASE", &cfg.RetrainLease},
+		{"RETRAIN_RETRY_MAX", &cfg.RetrainRetryMax},
 		{"SNAPSHOT_TTL", &cfg.SnapshotTTL},
 	}
 	for _, d := range durations {
@@ -250,6 +265,14 @@ func (c Config) Validate() error {
 	}
 	if c.TrainConcurrency < 1 {
 		return fmt.Errorf("TRAIN_CONCURRENCY must be at least 1")
+	}
+	if c.RetrainLease < 0 {
+		return fmt.Errorf("RETRAIN_LEASE must not be negative (0 derives it from the work)")
+	}
+	if c.RetrainRetryMax > 0 && c.RetrainRetryMax <= c.retryBase() {
+		// A cap at or below the base is a fixed delay wearing a backoff's name: the
+		// retry would never space out, which is the whole point of the cap.
+		return fmt.Errorf("RETRAIN_RETRY_MAX must be longer than RETRAIN_RETRY (%s)", c.retryBase())
 	}
 	ttl := c.WorkerTTL
 	if ttl <= 0 {
@@ -347,10 +370,78 @@ func (c Config) normalized() Config {
 	if c.RetrainRetry <= 0 {
 		c.RetrainRetry = defaultRetrainRetry
 	}
+	if c.RetrainRetryMax <= 0 {
+		c.RetrainRetryMax = defaultRetrainRetryMax
+	}
+	if c.RetrainRetryMax <= c.RetrainRetry {
+		// Only reachable when the configured base sits at or above the default cap:
+		// keep the cap above the base rather than below it, or the "backoff" would be
+		// a fixed delay. An explicitly configured cap this short is refused by
+		// Validate; this is the default colliding with a large base.
+		c.RetrainRetryMax = 2 * c.RetrainRetry
+	}
+	if c.RetrainLease <= 0 {
+		c.RetrainLease = workLease(c)
+	}
 	if c.DefaultRetrainCron == "" {
 		c.DefaultRetrainCron = defaultRetrainCron
 	}
 	return c
+}
+
+// retryBase is the backoff's base delay: RETRAIN_RETRY as configured, or the
+// default it would run with, so a Config built in code behaves like one read from
+// the environment.
+func (c Config) retryBase() time.Duration {
+	if c.RetrainRetry <= 0 {
+		return defaultRetrainRetry
+	}
+	return c.RetrainRetry
+}
+
+// workLease derives the default claim lease from the work one claim covers: a fit
+// is up to ceil(LOOKBACK / DRUID_MAX_RANGE) sequential Druid requests (one when no
+// range cap is set), each bounded by DRUID_TIMEOUT, plus a minute of margin. It is
+// never shorter than the retry base, which is the floor the old fixed lease
+// provided. A lease shorter than the work lets a survivor re-claim and re-train a
+// row that is still running — duplicate Druid scans at the worst possible moment.
+func workLease(c Config) time.Duration {
+	slices := int64(1)
+	if c.DruidMaxRange > 0 && c.Lookback > 0 {
+		slices = int64((c.Lookback + c.DruidMaxRange - 1) / c.DruidMaxRange)
+		if slices < 1 {
+			slices = 1
+		}
+	}
+	lease := time.Duration(slices)*c.DruidTimeout + time.Minute
+	if base := c.retryBase(); lease < base {
+		return base
+	}
+	return lease
+}
+
+// retryDelay returns how long after a failure attempt n (1 = the first failure) the
+// row is due again: base doubled once per further attempt, capped at max, so a hash
+// that keeps failing settles at one retry per cap instead of one per base forever.
+// attempt < 1 is treated as 1 (a row that never ran has one attempt's delay), and an
+// overflow at a very high attempt count falls back to max rather than to a negative
+// or zero delay — which would make the row due immediately and turn the backoff into
+// a hot loop.
+func retryDelay(base, max time.Duration, attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	d := base
+	for i := 1; i < attempt; i++ {
+		d *= 2
+		if d <= 0 || d >= max {
+			return max
+		}
+	}
+	if d > max {
+		return max
+	}
+	return d
 }
 
 // envDuration parses name as a Go duration; ok is false when it is unset.

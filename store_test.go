@@ -6,11 +6,13 @@ import (
 	"context"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	forecast "github.com/eduard-kolotushin/timeseries-forecast"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // TestPostgresStoreLazyConnect: an unreachable database must not turn the store
@@ -261,12 +263,12 @@ func TestPostgresMembership(t *testing.T) {
 }
 
 // pluginRetrainDDL is forecast.retrain as timeseries-grafana creates it
-// (pkg/store/migrations/0002_retrain.sql), plus the superseded_at column the plugin
-// adds for a schedule a newer key replaced. It lives here as a test fixture: the
-// table is created and owned by the plugin — this process only reads, claims and
-// finishes rows in it — so the worker's insert/claim/finish SQL would run in no test
-// at all when the database has never seen the plugin (CI provisions a bare
-// postgres:17).
+// (pkg/store/migrations/0002_retrain.sql plus 0003_retrain_attempts.sql), plus the
+// superseded_at column the plugin adds for a schedule a newer key replaced. It lives
+// here as a test fixture: the table is created and owned by the plugin — this process
+// only reads, claims and finishes rows in it — so the worker's insert/claim/finish
+// SQL would run in no test at all when the database has never seen the plugin (CI
+// provisions a bare postgres:17).
 const pluginRetrainDDL = `
 CREATE SCHEMA IF NOT EXISTS forecast;
 CREATE TABLE IF NOT EXISTS forecast.retrain (
@@ -283,6 +285,7 @@ CREATE TABLE IF NOT EXISTS forecast.retrain (
   last_status TEXT,
   claimed_by TEXT,
   claimed_until TIMESTAMPTZ,
+  attempts INT NOT NULL DEFAULT 0,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   superseded_at TIMESTAMPTZ,
   CONSTRAINT retrain_scope_org_key_unique UNIQUE (scope, org_id, key)
@@ -291,6 +294,8 @@ CREATE TABLE IF NOT EXISTS forecast.retrain (
 -- the plugin's own migration does; CREATE TABLE IF NOT EXISTS alone would leave a
 -- legacy table without the column the claim filters on.
 ALTER TABLE forecast.retrain ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ;
+-- Same for the retry counter the claim returns and the finish writes.
+ALTER TABLE forecast.retrain ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
 `
 
 // ensurePluginRetrainTable provides forecast.retrain in the plugin's shape.
@@ -396,7 +401,7 @@ SELECT cron, timezone FROM forecast.retrain WHERE scope = 'baseline' AND key = $
 	// lease can expire mid-retrain and the row go to another worker, whose claim
 	// and next_run_at a stale finish would otherwise overwrite.
 	next := time.Now().UTC().Add(time.Hour).Truncate(time.Minute)
-	if err := s.Done(ctx, "someone-else", orgID, key, next, "error: stale"); err != nil {
+	if err := s.Done(ctx, "someone-else", orgID, key, next, "error: stale", 2); err != nil {
 		t.Fatal(err)
 	}
 	var (
@@ -420,7 +425,7 @@ FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&holder,
 		t.Fatalf("a non-holder wrote last_status=%v last_run_at=%v, want the row untouched", staleStat, lastRun)
 	}
 
-	if err := s.Done(ctx, "baselines-store-test", orgID, key, next, "ok"); err != nil {
+	if err := s.Done(ctx, "baselines-store-test", orgID, key, next, "ok", 0); err != nil {
 		t.Fatal(err)
 	}
 	var (
@@ -446,7 +451,7 @@ FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key).Scan(&status,
 	// once the holder has finished, an owner that lost its lease must still not write
 	// its own stale outcome over this row.
 	staleNext := next.Add(time.Hour)
-	if err := s.Done(ctx, "baselines-store-test", orgID, key, staleNext, "error: stale"); err != nil {
+	if err := s.Done(ctx, "baselines-store-test", orgID, key, staleNext, "error: stale", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.pool.QueryRow(ctx, `
@@ -612,5 +617,125 @@ ON CONFLICT (scope, org_id, key) DO UPDATE SET last_run_at = EXCLUDED.last_run_a
 		if exists != tc.want {
 			t.Fatalf("snapshot %s exists=%v, want %v", tc.key, exists, tc.want)
 		}
+	}
+}
+
+// TestPostgresClaimReclaimsAnExpiredLease is the fleet case the reliability contract
+// exists for: a worker claims a due row, dies mid-retrain and never finishes it. A
+// claim never touches next_run_at, so once claimed_until passes the row is due again
+// and a survivor takes it — the baseline the dead worker held is retrained, not
+// stranded, and the hashes it never reached were due all along. The stale worker can
+// then neither extend the claim nor write its outcome over the survivor's.
+func TestPostgresClaimReclaimsAnExpiredLease(t *testing.T) {
+	s, ctx := openTestStore(t)
+	ensurePluginRetrainTable(t, s)
+
+	key := "baselines-lease-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM forecast.retrain WHERE scope = 'baseline' AND key = $1`, key)
+	})
+	if err := s.Schedule(ctx, []string{key}, "*/5 * * * *", "UTC"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+UPDATE forecast.retrain SET next_run_at = now() - interval '10 years'
+WHERE scope = 'baseline' AND key = $1`, key); err != nil {
+		t.Fatal(err)
+	}
+	// The claim is fleet-wide, so another test's rows can come back with it; only this
+	// row is of interest.
+	claim := func(owner string) *retrainClaim {
+		claims, err := s.Claim(ctx, owner, time.Minute, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range claims {
+			if claims[i].Key == key {
+				return &claims[i]
+			}
+		}
+		return nil
+	}
+	if claim("dead-worker") == nil {
+		t.Fatal("the due row was not claimed")
+	}
+	// A live lease still holds the fleet out, so the reclaim is not early.
+	if c := claim("survivor"); c != nil {
+		t.Fatalf("a live lease was claimed twice: %+v", c)
+	}
+	// The crash leaves claimed_by and claimed_until exactly as they were; only the
+	// lease has to expire. The UPDATE stands in for the clock passing.
+	if _, err := s.pool.Exec(ctx, `
+UPDATE forecast.retrain SET claimed_until = now() - interval '1 second'
+WHERE scope = 'baseline' AND key = $1`, key); err != nil {
+		t.Fatal(err)
+	}
+	reclaimed := claim("survivor")
+	if reclaimed == nil {
+		t.Fatal("an expired lease was not re-claimed: the dead worker stranded the row")
+	}
+	if reclaimed.Attempts != 0 {
+		t.Fatalf("attempts=%d, want the untouched 0", reclaimed.Attempts)
+	}
+	// The dead worker is no longer an owner: it may neither extend the claim nor write
+	// its outcome — next run, status or attempt count — over the survivor's.
+	if ok, err := s.Extend(ctx, "dead-worker", 0, key, time.Hour); err != nil || ok {
+		t.Fatalf("a stale owner extended the claim: ok=%v err=%v", ok, err)
+	}
+	staleNext := time.Now().UTC().Add(time.Hour)
+	if err := s.Done(ctx, "dead-worker", 0, key, staleNext, "error: dead", 7); err != nil {
+		t.Fatal(err)
+	}
+	var (
+		status   *string
+		dueAt    time.Time
+		attempts int
+	)
+	if err := s.pool.QueryRow(ctx, `
+SELECT last_status, next_run_at, attempts FROM forecast.retrain
+WHERE scope = 'baseline' AND key = $1`, key).Scan(&status, &dueAt, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != nil || attempts != 0 || dueAt.After(time.Now().UTC()) {
+		t.Fatalf("a stale owner wrote its outcome: status=%v attempts=%d next=%s", status, attempts, dueAt)
+	}
+	// The survivor still owns the row: it extends, and its own finish lands with the
+	// attempt count the retry backoff is derived from.
+	if ok, err := s.Extend(ctx, "survivor", 0, key, time.Hour); err != nil || !ok {
+		t.Fatalf("the owner could not extend its claim: ok=%v err=%v", ok, err)
+	}
+	next := time.Now().UTC().Add(5 * time.Minute)
+	if err := s.Done(ctx, "survivor", 0, key, next, "error: druid is down (attempt 1)", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.pool.QueryRow(ctx, `
+SELECT last_status, next_run_at, attempts FROM forecast.retrain
+WHERE scope = 'baseline' AND key = $1`, key).Scan(&status, &dueAt, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 || status == nil || !strings.Contains(*status, "attempt 1") {
+		t.Fatalf("the owner's finish did not land: status=%v attempts=%d", status, attempts)
+	}
+	if d := dueAt.Sub(next); d < -time.Millisecond || d > time.Millisecond {
+		t.Fatalf("next_run_at %s, want about %s", dueAt, next)
+	}
+}
+
+// TestMissingAttemptsError: the attempts column belongs to the plugin's table, so a
+// database that has not had the plugin's 0003 migration applied must be named, not
+// surface a bare undefined-column error on every tick. Every other error passes
+// through untouched, because only this one has a remedy worth naming.
+func TestMissingAttemptsError(t *testing.T) {
+	t.Parallel()
+	named := missingAttemptsError(&pgconn.PgError{Code: "42703", ColumnName: "attempts", Message: `column "attempts" does not exist`})
+	if !strings.Contains(named.Error(), "gpx_forecast_migrate") {
+		t.Fatalf("err=%v, want the remedy named", named)
+	}
+	other := &pgconn.PgError{Code: "42703", ColumnName: "superseded_at", Message: `column "superseded_at" does not exist`}
+	if got := missingAttemptsError(other); got != error(other) {
+		t.Fatalf("err=%v, want it passed through", got)
+	}
+	if got := missingAttemptsError(context.Canceled); got != context.Canceled {
+		t.Fatalf("err=%v, want it passed through", got)
 	}
 }

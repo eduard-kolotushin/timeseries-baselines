@@ -31,7 +31,7 @@ Each tick (immediate, then every `INTERVAL`):
 3. `Hashes(now - SCAN_RANGE, now)` — one Druid scan, sliced under `DRUID_MAX_RANGE` and cached for `HASH_SCAN_TTL`. Ownership is computed from the result: the hashes another worker owns are dropped here.
 4. `Heartbeat` this worker into `baselines.workers` (best effort: an error keeps the previous peer set). It runs after the scan because the count it reports is the owned set, and it stays ahead of the retrain and the publish. The tick then sweeps stale snapshots once (`SNAPSHOT_TTL`; see Snapshot store), also best effort.
 5. Schedule: **one** `INSERT … SELECT … FROM unnest($1::text[]) ON CONFLICT (scope, org_id, key) DO NOTHING` inserts a row for every owned hash that has none (`scope='baseline'`, `org_id=0`, `DEFAULT_RETRAIN_CRON`, `timezone='UTC'`, due now). An existing row keeps its cron, timezone and `enabled`: the operator owns the schedule and a restart must not reset it.
-6. Retrain: `Claim(self, RETRAIN_RETRY, TRAIN_CONCURRENCY)` takes due `forecast.retrain` rows (**any** worker may retrain **any** hash, not only the ones it owns), then per claim: `Series(hash, now-LOOKBACK, now)` → `FitSeasonalBaseline` → `SnapshotOf` → `Put` into `baselines.snapshots` → `Done(self, claim.OrgID, key, next=nextRun(cron, tz, now), "ok")`. A failure writes `last_status='error: …'` and `next_run_at=now()+RETRAIN_RETRY`. `Done` only touches a row this worker still claims (`claimed_by = self`, addressed by the full `(scope, org_id, key)`); a lease that expired mid-retrain appears as zero rows affected, logs `claim lost` at debug, and is not an error.
+6. Retrain: `Claim(self, RETRAIN_LEASE, TRAIN_CONCURRENCY)` takes due `forecast.retrain` rows (**any** worker may retrain **any** hash, not only the ones it owns), and each claim is remembered so shutdown can release it. Per claim: `Extend` the lease to `RETRAIN_LEASE` (skip the row if the claim already moved on) → `Series(hash, now-LOOKBACK, now)` → `FitSeasonalBaseline` → `SnapshotOf` → `Put` into `baselines.snapshots` → `Done(self, claim.OrgID, key, next=nextRun(cron, tz, now), "ok", attempts=0)`. A failure writes `last_status='error: … (attempt N)'` and `next_run_at=now+retryDelay(RETRAIN_RETRY, RETRAIN_RETRY_MAX, N)` with `attempts=N`. `Done` only touches a row this worker still claims (`claimed_by = self`, addressed by the full `(scope, org_id, key)`); a lease that expired mid-retrain appears as zero rows affected, logs `claim lost` at debug, and is not an error. The tick line counts the rows claimed, retrained and failed.
 7. Publish: for each owned hash whose snapshot is fresh (`SNAPSHOT_CACHE_TTL`: at most one `Fresh` query for all owned keys per `SNAPSHOT_CACHE_TTL`, `Restore` only what moved), `ForecastRange(ts-1m, ts)` with `ts = now.Truncate(1m) + AHEAD_MINUTES`, and emit when `ts` is newer than the in-memory `published` mark and the value is not NaN. The one-minute lookback is deliberate: a grid that is not aligned to the wall-clock minute has no point exactly at `ts`, and asking for the exact point would return `ErrEmptyRange` on every tick; on an aligned grid the last point *is* `ts`.
 
 `metric_ts` is the wall-clock horizon, not the last observed timestamp, so a Druid outage or a stalled retrain cannot stop publishing as long as a snapshot exists. The clock is read once per tick, before the scan: a tick is one minute of wall clock however long its rate-limited scan and retrain take, so a slow tick still publishes the minute it started in instead of skipping it and colliding with the next tick (see Horizon clock). The metrics Kafka topic is not read; Druid is the source of truth for training. The Kafka key is `metric_hash|metric_ts`, so one point has one key: repeats land on the same partition and can be compacted away. Records are written with `RequiredAcks: RequireAll`: a literal `kafka.Writer` is not `kafka.NewWriter`, which is the only place kafka-go turns a 0 into `RequireAll`, and at 0 (`RequireNone`) the client's `Produce` returns `(nil, nil)`, so a record the broker rejects would look published. With all acks a rejection is an error: it is logged per metric and the point is left unmarked, so the next tick publishes it again instead of losing the minute. Duplicate `(metric_hash, metric_ts)` pairs are also skipped in memory per process, but a restart or a membership change republishes: **consumers must treat the topic as upsert** and collapse duplicates instead of summing them (see Scaling and ingestion).
@@ -182,9 +182,10 @@ No host and no URL means persist off: `store == nil`, the schedule and heartbeat
 | `scope`, `org_id`, `key` | `'baseline'`, `0`, `metric_hash` |
 | `cron`, `timezone` | `DEFAULT_RETRAIN_CRON` (default `0 3 * * *`), `UTC` on insert; never reset by a later tick |
 | `enabled`, `spec` | Left alone. The plugin claims only `scope='panel'` rows with a spec; the worker claims only `scope='baseline'` rows |
-| `next_run_at` | Due when `<= now()`. Set to `nextRun(cron, tz, now)` on success and to `now + RETRAIN_RETRY` on failure |
-| `claimed_by`, `claimed_until` | Lease: a row is claimable while `claimed_until IS NULL OR claimed_until < now()` |
-| `last_status` | `ok`, or `error: <message>` |
+| `next_run_at` | Due when `<= now()`. Set to `nextRun(cron, tz, now)` on success and to `now + min(RETRAIN_RETRY × 2^(attempts-1), RETRAIN_RETRY_MAX)` on failure |
+| `claimed_by`, `claimed_until` | Lease: a row is claimable while `claimed_until IS NULL OR claimed_until < now()`. `Extend` moves only `claimed_until`, to `now() + RETRAIN_LEASE`, immediately before a row's fit |
+| `last_status` | `ok`, or `error: <message>` — a failure that has one or more attempts behind it reads `error: <message> (attempt N)` |
+| `attempts` | Consecutive failed retrains, incremented on a failure and reset to `0` on a success. Both writers of the table use it to space the retries. The column is added by the plugin's migration `0003_retrain_attempts.sql`: this repo never runs DDL against `forecast.retrain`, and a table without the column fails every claim by name (`gpx_forecast_migrate`) rather than silently claiming nothing |
 | `superseded_at` | Set by the plugin on a schedule a newer key replaced. Never claimed by either side, so a superseded row is not retrained |
 
 The worker schedules its owned set with one statement per tick, not one per hash:
@@ -207,21 +208,37 @@ WITH due AS (
 )
 UPDATE forecast.retrain r SET claimed_by = $1, claimed_until = now() + $3::interval
 FROM due WHERE r.scope = due.scope AND r.org_id = due.org_id AND r.key = due.key
-RETURNING r.org_id, r.key, r.cron, r.timezone
+RETURNING r.org_id, r.key, r.cron, r.timezone, r.attempts
 ```
 
-`FOR UPDATE SKIP LOCKED` is what makes the claim fleet-wide and safe: two workers ticking at the same second both get rows, but never the same row, and neither blocks. The lease means a worker that dies mid-retrain releases the claim after `RETRAIN_RETRY` (default 5m) rather than stranding it. Because a claim is not tied to ownership, a hash owned by a stopped worker is still retrained on time, and the retrain cost is bounded by `TRAIN_CONCURRENCY` (default 2) per worker regardless of how many rows are due. The claim carries the row's `org_id`, which is how `Done` addresses the row by its full key. A claim is then checked against this worker's scan before anything is fitted (`trainable`): a row below `LOOKBACK` is finished with the reason and without a Druid request, so a row that outlived the rule which would not create it now cannot train on the fraction of the window that is left.
+`FOR UPDATE SKIP LOCKED` is what makes the claim fleet-wide and safe: two workers ticking at the same second both get rows, but never the same row, and neither blocks. The lease means a worker that dies mid-retrain does not strand the row: a claim never touches `next_run_at`, so once `claimed_until` expires the row is due again and any survivor claims it — the hashes the dead worker held, and the ones it never reached, are retrained by the fleet with no handshake. Because a claim is not tied to ownership, a hash owned by a stopped worker is still retrained on time, and the retrain cost is bounded by `TRAIN_CONCURRENCY` (default 2) per worker regardless of how many rows are due. The claim carries the row's `org_id`, which is how `Done` addresses the row by its full key.
+
+The lease is **renewed before the work it protects**. A tick's claims share one lease, and a single baseline fit is up to `ceil(LOOKBACK / DRUID_MAX_RANGE)` sequential Druid requests (14 at the default shape), so the fixed `RETRAIN_RETRY` lease could expire mid-fit and let a survivor re-claim and re-train a row that is still running — duplicating the heaviest scans exactly when the fleet is loaded. Each claim is therefore extended to `RETRAIN_LEASE` — default `max(RETRAIN_RETRY, ceil(LOOKBACK / DRUID_MAX_RANGE) × DRUID_TIMEOUT + 1m)`, i.e. 15m at `LOOKBACK=336h`, `DRUID_MAX_RANGE=24h`, `DRUID_TIMEOUT=60s` — immediately before its fit, and the fit runs under a context deadline equal to that lease:
+
+```sql
+UPDATE forecast.retrain
+SET claimed_until = now() + $5::interval
+WHERE scope = 'baseline' AND org_id = $3 AND key = $1 AND claimed_by = $2
+```
+
+Zero rows extended means the claim was handed to a newer owner while this worker waited; that row is dropped without a Druid request and without a finish, because the new owner's `next_run_at`, `last_status` and `attempts` are theirs to write. An extend error is logged and the fit still runs: the claim taken at the start of the tick covers it.
+
+A claim is then checked against this worker's scan before anything is fitted (`trainable`): a row below `LOOKBACK` is finished with the reason and without a Druid request, so a row that outlived the rule which would not create it now cannot train on the fraction of the window that is left. That is a failure like any other — it burns an attempt and backs off — because the worker did run.
 
 Releasing a claim is owner-guarded, because a retrain that outlived its lease has already been re-claimed by another worker:
 
 ```sql
 UPDATE forecast.retrain
-SET next_run_at = $4, last_run_at = now(), last_status = $5,
+SET next_run_at = $4, last_run_at = now(), last_status = $5, attempts = $6,
     claimed_by = NULL, claimed_until = NULL
 WHERE scope = 'baseline' AND org_id = $3 AND key = $1 AND claimed_by = $2
 ```
 
-Zero rows affected means the claim was lost: the finish is dropped (debug log, no error) rather than overwriting the newer owner's `next_run_at`, `last_status` and claim. The owner predicate is the whole guard — there is deliberately no `claimed_by IS NULL` escape, which would let a stale worker write its own outcome over a row the newer owner had already finished and released.
+Zero rows affected means the claim was lost: the finish is dropped (debug log, no error) rather than overwriting the newer owner's `next_run_at`, `last_status`, `attempts` and claim. The owner predicate is the whole guard — there is deliberately no `claimed_by IS NULL` escape, which would let a stale worker write its own outcome over a row the newer owner had already finished and released.
+
+`Done` writes the row's attempt counter in the same statement as its outcome: `0` after a success, the claim's previous count plus one after a failure, and the unchanged count for a claim released at shutdown (a deployment is not the row's failure). A failure's `next_run_at` is `now + retryDelay(RETRAIN_RETRY, RETRAIN_RETRY_MAX, attempts)` — the base doubled once per attempt and capped, so a hash that keeps failing settles at one retry per cap instead of one per base forever, while the fleet's queue drains instead of being re-flooded by its own failures.
+
+**Shutdown releases the claims.** The process runs until `SIGINT`/`SIGTERM`, and the tick's fits are cancelled when the context ends, so whatever the tick has already claimed is released before returning: each held claim is finished with `next_run_at = now`, `last_status = 'error: interrupted'` and its attempt count untouched, under a short detached timeout so the release itself is not cancelled with the tick. The claim map is filled as rows are claimed and a row leaves it only after a successful `Done`, so a claim whose finish failed (a database blip) is released at shutdown too. A second release is harmless: it is the same zero-row owner-guard case as any stale finish.
 
 `nextRun` is `cron.ParseStandard(cron)` + `time.LoadLocation(tz)` + `Schedule.Next(now.In(loc)).UTC()`. `ParseStandard` is the 5-field form plus `@daily` / `@hourly` / `@every 1h` descriptors, and `Validate` refuses a `DEFAULT_RETRAIN_CRON` that does not parse at startup.
 

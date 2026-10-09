@@ -264,6 +264,17 @@ func TestConfigValidate(t *testing.T) {
 			c.ShardPeers = []string{"a"}
 			c.ShardDNS = "baselines"
 		}, "SHARD_PEERS"},
+		{"negative retrain lease", func(c *Config) { c.RetrainLease = -time.Minute }, "RETRAIN_LEASE"},
+		{"retrain lease of zero derives", func(c *Config) { c.RetrainLease = 0 }, ""},
+		{"retrain retry cap at the base", func(c *Config) { c.RetrainRetryMax = defaultRetrainRetry }, "RETRAIN_RETRY_MAX"},
+		{"retrain retry cap below the base", func(c *Config) {
+			c.RetrainRetry = time.Minute
+			c.RetrainRetryMax = time.Second
+		}, "RETRAIN_RETRY_MAX"},
+		{"retrain retry cap above the base", func(c *Config) {
+			c.RetrainRetry = time.Minute
+			c.RetrainRetryMax = time.Hour
+		}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := ok
@@ -381,5 +392,98 @@ func TestStoreDSN(t *testing.T) {
 				t.Fatalf("storeDSN() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestRetryDelay pins the backoff curve: the base doubled once per further attempt,
+// clamped at the cap, so a hash that cannot be fitted settles at one retry per cap
+// instead of one per base forever. The degenerate inputs matter as much as the curve:
+// a missing attempt count behaves like a first failure, and an overflow at a very high
+// count lands on the cap rather than on a zero (or negative) delay, which would make
+// the row due immediately and turn the backoff into a hot loop.
+func TestRetryDelay(t *testing.T) {
+	t.Parallel()
+	const (
+		base = 5 * time.Minute
+		max  = time.Hour
+	)
+	for _, tc := range []struct {
+		name    string
+		base    time.Duration
+		max     time.Duration
+		attempt int
+		want    time.Duration
+	}{
+		{name: "first failure is the base", base: base, max: max, attempt: 1, want: base},
+		{name: "second failure doubles", base: base, max: max, attempt: 2, want: 2 * base},
+		{name: "third failure doubles again", base: base, max: max, attempt: 3, want: 4 * base},
+		{name: "the cap clamps", base: base, max: max, attempt: 20, want: max},
+		{name: "a missing attempt count behaves like the first", base: base, max: max, attempt: 0, want: base},
+		{name: "a negative attempt count behaves like the first", base: base, max: max, attempt: -4, want: base},
+		{name: "an overflow lands on the cap", base: time.Duration(1) << 62, max: time.Duration(1)<<62 - 1, attempt: 3, want: time.Duration(1)<<62 - 1},
+		{name: "a cap below the base still wins", base: time.Hour, max: time.Minute, attempt: 1, want: time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retryDelay(tc.base, tc.max, tc.attempt); got != tc.want {
+				t.Fatalf("retryDelay(%s, %s, %d) = %s, want %s", tc.base, tc.max, tc.attempt, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWorkLease pins the derived claim lease: it must cover the whole fit — one Druid
+// request per DRUID_MAX_RANGE slice of LOOKBACK, each bounded by DRUID_TIMEOUT, plus a
+// minute of margin — and never fall below the retry base. A lease shorter than the work
+// is what lets a survivor re-claim and re-train a row that is still running.
+func TestWorkLease(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+		want time.Duration
+	}{
+		{
+			name: "one request per window when no range cap is set",
+			cfg:  Config{Lookback: 336 * time.Hour, DruidTimeout: time.Minute, RetrainRetry: 5 * time.Minute},
+			want: 5 * time.Minute, // 1m + 1m margin, raised to the retry base
+		},
+		{
+			name: "a slice per DRUID_MAX_RANGE",
+			cfg:  Config{Lookback: 336 * time.Hour, DruidMaxRange: 24 * time.Hour, DruidTimeout: time.Minute, RetrainRetry: 5 * time.Minute},
+			want: 15 * time.Minute, // 14 slices x 1m + 1m
+		},
+		{
+			name: "a lookback shorter than one slice is one request",
+			cfg:  Config{Lookback: 6 * time.Hour, DruidMaxRange: 24 * time.Hour, DruidTimeout: time.Minute, RetrainRetry: 5 * time.Minute},
+			want: 5 * time.Minute, // 1m + 1m, raised to the retry base
+		},
+		{
+			name: "a long lookback of short slices scales",
+			cfg:  Config{Lookback: 336 * time.Hour, DruidMaxRange: time.Hour, DruidTimeout: 30 * time.Second, RetrainRetry: 5 * time.Minute},
+			want: 169 * time.Minute, // 336 slices x 30s + 1m
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workLease(tc.cfg); got != tc.want {
+				t.Fatalf("workLease(%+v) = %s, want %s", tc.cfg, got, tc.want)
+			}
+		})
+	}
+	// normalized() derives the lease only when it is unset, and keeps the cap above the
+	// base even when the default cap collides with a large configured base.
+	c := Config{Lookback: 336 * time.Hour, DruidMaxRange: 24 * time.Hour, DruidTimeout: time.Minute}.normalized()
+	if c.RetrainLease != 15*time.Minute {
+		t.Fatalf("derived lease = %s, want 15m", c.RetrainLease)
+	}
+	if c.RetrainRetryMax != defaultRetrainRetryMax {
+		t.Fatalf("default cap = %s, want %s", c.RetrainRetryMax, defaultRetrainRetryMax)
+	}
+	c = Config{RetrainLease: time.Minute, RetrainRetry: 5 * time.Minute, RetrainRetryMax: 2 * time.Hour}.normalized()
+	if c.RetrainLease != time.Minute || c.RetrainRetryMax != 2*time.Hour {
+		t.Fatalf("an explicit lease/cap was rewritten: lease=%s cap=%s", c.RetrainLease, c.RetrainRetryMax)
+	}
+	c = Config{RetrainRetry: 3 * time.Hour}.normalized()
+	if c.RetrainRetryMax <= c.RetrainRetry {
+		t.Fatalf("cap %s did not follow a base of %s", c.RetrainRetryMax, c.RetrainRetry)
 	}
 }

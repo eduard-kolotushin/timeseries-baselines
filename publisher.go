@@ -48,6 +48,12 @@ type Publisher struct {
 	// but not yet trained does not log on every tick.
 	warned map[string]string
 
+	// held is every claim this tick took and has not finished yet, so a shutdown can
+	// release them instead of parking up to TRAIN_CONCURRENCY rows per worker for a
+	// whole lease. heldMu guards it: the fits run in goroutines.
+	heldMu sync.Mutex
+	held   map[string]retrainClaim
+
 	lastPeers    int
 	lastOwned    int
 	countsLogged bool
@@ -69,6 +75,12 @@ type tickResult struct {
 	ineligible int
 	published  int
 	retrained  int
+	// claimed is how many due rows this tick's claim statement handed out, and
+	// failed how many of them were recorded as failed (a claim skipped because a
+	// survivor took it counts as claimed but neither retrained nor failed), so the
+	// tick line shows a backlog draining instead of only what succeeded.
+	claimed int
+	failed  int
 }
 
 func newPublisher(cfg Config, src metricReader, sink baselineSink, cal *forecast.Calendar, store storeBackend) *Publisher {
@@ -85,6 +97,7 @@ func newPublisher(cfg Config, src metricReader, sink baselineSink, cal *forecast
 		now:       time.Now,
 		fitted:    make(map[string]snapshotFit),
 		warned:    make(map[string]string),
+		held:      make(map[string]retrainClaim),
 	}
 }
 
@@ -128,6 +141,9 @@ func (p *Publisher) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Hand the claims back before returning, so a rolling restart costs no
+			// lease-length wait per worker.
+			p.releaseHeld(ctx)
 			return
 		case <-t.C:
 			p.tick(ctx)
@@ -178,7 +194,10 @@ func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 		skipped:    len(spans) - len(keys),
 		ineligible: len(keys) - len(ready),
 	}
-	res.retrained = p.retrain(ctx, ready, now)
+	counts := p.retrain(ctx, ready, now)
+	res.claimed = counts.claimed
+	res.retrained = counts.trained
+	res.failed = counts.failed
 	res.published = p.emit(ctx, spans, ready, owned, now)
 	return res, true
 }
@@ -241,15 +260,31 @@ func (p *Publisher) sweep(ctx context.Context) {
 	}
 }
 
+// retrainCounts is one tick's retrain outcome: the rows the claim statement handed
+// out, and how many of them were retrained or recorded as failed. A row skipped
+// because its claim moved to a survivor is counted as claimed but neither retrained
+// nor failed — it was not this worker's to judge.
+type retrainCounts struct {
+	claimed int
+	trained int
+	failed  int
+}
+
 // retrain schedules every owned hash that is eligible and has no row yet, then
 // claims due rows fleet-wide and trains them. Claims are deliberately not
 // restricted to owned hashes: any worker may run any schedule, which is what
-// keeps a retrain alive when the hash's rendezvous owner is down. claims are
-// still checked against this worker's scan (see trainable), so a row below
-// LOOKBACK is finished with a reason instead of trained.
-func (p *Publisher) retrain(ctx context.Context, keys []string, now time.Time) int {
+// keeps a retrain alive when the hash's rendezvous owner is down — and what lets a
+// survivor pick up the rows a worker that died left behind. Claims are still checked
+// against this worker's scan (see trainable), so a row below LOOKBACK is finished
+// with a reason instead of trained.
+//
+// The claim lease is the work lease (RetrainLease), not the retry base: each claim
+// is extended again right before its fit, so a fit that takes longer than a tick is
+// still covered. Every claim is remembered until its finish lands, so a shutdown can
+// release what is left.
+func (p *Publisher) retrain(ctx context.Context, keys []string, now time.Time) retrainCounts {
 	if p.store == nil {
-		return 0
+		return retrainCounts{}
 	}
 	// One statement for the whole owned set: a row per hash exists after the
 	// first tick, so the other 1439 ticks a day would pay an INSERT each for
@@ -259,18 +294,18 @@ func (p *Publisher) retrain(ctx context.Context, keys []string, now time.Time) i
 		// per tick is enough detail.
 		slog.Error("schedule", "hashes", len(keys), "err", err)
 	}
-	claims, err := p.store.Claim(ctx, p.peers.self, p.cfg.RetrainRetry, p.cfg.TrainConcurrency)
+	claims, err := p.store.Claim(ctx, p.peers.self, p.cfg.RetrainLease, p.cfg.TrainConcurrency)
 	if err != nil {
 		slog.Error("claim retrains", "err", err)
-		return 0
+		return retrainCounts{}
 	}
 	if len(claims) == 0 {
-		return 0
+		return retrainCounts{}
 	}
+	out := retrainCounts{claimed: len(claims)}
 	var (
-		wg    sync.WaitGroup
-		mu    sync.Mutex
-		train int
+		wg sync.WaitGroup
+		mu sync.Mutex
 	)
 	for _, claim := range claims {
 		// Bounded goroutine pool: TRAIN_CONCURRENCY fits at a time, and the claim
@@ -279,41 +314,119 @@ func (p *Publisher) retrain(ctx context.Context, keys []string, now time.Time) i
 		if err != nil {
 			break
 		}
+		p.hold(claim)
 		wg.Add(1)
 		go func(c retrainClaim) {
 			defer wg.Done()
 			defer release()
-			if p.trainHash(ctx, c, now) {
-				mu.Lock()
-				train++
-				mu.Unlock()
+			trained, failed := p.trainHash(ctx, c, now)
+			mu.Lock()
+			if trained {
+				out.trained++
 			}
+			if failed {
+				out.failed++
+			}
+			mu.Unlock()
 		}(claim)
 	}
 	wg.Wait()
-	return train
+	return out
 }
 
-// trainHash refits one hash and stores the snapshot. The finish carries the
-// owner of the claim: a lease that expired while this retrain ran has already
-// been re-claimed, and that worker's row must not be overwritten from here.
-func (p *Publisher) trainHash(ctx context.Context, c retrainClaim, now time.Time) bool {
+// trainHash refits one hash and stores the snapshot. The fit runs under the lease it
+// extends, so it can neither outlive its claim (and be re-trained concurrently by a
+// survivor) nor be cut short; a claim that already moved on is skipped without a Druid
+// request and without a finish, because the newer owner's row is theirs to write. The
+// finish carries the owner of the claim for the same reason. It reports whether the
+// row was retrained and whether it was recorded as failed.
+func (p *Publisher) trainHash(ctx context.Context, c retrainClaim, now time.Time) (trained, failed bool) {
+	if ok, err := p.store.Extend(ctx, p.peers.self, c.OrgID, c.Key, p.cfg.RetrainLease); err != nil {
+		// The claim taken at the start of the tick still covers the fit, so the row is
+		// worked — but a store that cannot extend may not be able to finish either, so
+		// the failure is not swallowed.
+		slog.Error("retrain extend", "metric_hash", c.Key, "err", err)
+	} else if !ok {
+		slog.Debug("claim lost", "metric_hash", c.Key, "owner", p.peers.self)
+		return false, false
+	}
+	fctx, cancel := context.WithTimeout(ctx, p.cfg.RetrainLease)
+	defer cancel()
 	err := p.trainable(c.Key)
 	if err == nil {
-		err = p.fitHash(ctx, c.Key, now)
+		err = p.fitHash(fctx, c.Key, now)
 	}
 	if err == nil {
 		var next time.Time
 		if next, err = nextRun(c.Cron, c.Timezone, now); err == nil {
-			p.finish(ctx, c, next, "ok")
-			return true
+			p.finish(ctx, c, next, "ok", 0)
+			return true, false
 		}
 	}
-	slog.Error("retrain", "metric_hash", c.Key, "err", err)
-	// A failure is due again after RETRAIN_RETRY rather than at the next cron
-	// fire: the row is broken now, and waiting until tomorrow hides it.
-	p.finish(ctx, c, now.Add(p.cfg.RetrainRetry), "error: "+err.Error())
-	return false
+	attempts := c.Attempts + 1
+	status := retryStatus(err, attempts)
+	slog.Error("retrain", "metric_hash", c.Key, "err", err, "attempts", attempts)
+	// A failure is due again after a backoff derived from the attempt count rather
+	// than at the base delay every time: one overload can fail many rows at once, and
+	// re-enqueueing all of them on the same cadence competes with the legitimate
+	// backlog instead of backing off.
+	p.finish(ctx, c, now.Add(retryDelay(p.cfg.RetrainRetry, p.cfg.RetrainRetryMax, attempts)), status, attempts)
+	return false, true
+}
+
+// retryStatus renders a failed retrain's status: the error, with the attempt count
+// appended once the row has one, so a chronic failure is visible in the row the
+// plugin's Retrain schedules page renders without a new field. "(attempt 0)" would
+// read as a failure that never happened, so a zero count is omitted.
+func retryStatus(err error, attempts int) string {
+	if attempts > 0 {
+		return fmt.Sprintf("error: %s (attempt %d)", err, attempts)
+	}
+	return "error: " + err.Error()
+}
+
+// hold remembers a claim for shutdown, and unhold forgets one whose finish the store
+// accepted.
+func (p *Publisher) hold(c retrainClaim) {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+	p.held[c.Key] = c
+}
+
+func (p *Publisher) unhold(key string) {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+	delete(p.held, key)
+}
+
+// releaseHeld hands every claim this process still holds back to the fleet, so a
+// restart does not park up to TRAIN_CONCURRENCY rows per worker for a whole lease.
+// It runs under a short timeout derived from a detached context: the context that
+// woke it is the one being cancelled, so using it directly would cancel the release
+// itself. The attempt count is left alone — a deployment is not the row's failure —
+// and a release that loses a row to a newer owner is Done's ordinary zero-row case.
+func (p *Publisher) releaseHeld(ctx context.Context) {
+	if p.store == nil {
+		return
+	}
+	p.heldMu.Lock()
+	held := make([]retrainClaim, 0, len(p.held))
+	for _, c := range p.held {
+		held = append(held, c)
+	}
+	p.heldMu.Unlock()
+	if len(held) == 0 {
+		return
+	}
+	relCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	for _, c := range held {
+		if err := p.store.Done(relCtx, p.peers.self, c.OrgID, c.Key, time.Now(), "error: interrupted", c.Attempts); err != nil {
+			slog.Error("retrain release", "metric_hash", c.Key, "err", err)
+			continue
+		}
+		p.unhold(c.Key)
+	}
 }
 
 // trainable rejects a claim the scan already knows is below LOOKBACK, before a
@@ -336,10 +449,15 @@ func (p *Publisher) trainable(key string) error {
 	return nil
 }
 
-func (p *Publisher) finish(ctx context.Context, c retrainClaim, next time.Time, status string) {
-	if err := p.store.Done(ctx, p.peers.self, c.OrgID, c.Key, next, status); err != nil {
+// finish records a row's outcome and drops the claim. unhold runs only when the store
+// accepted the write: a failed Done (a database blip, a cancelled shutdown context)
+// leaves the row held, so releaseHeld still hands it back.
+func (p *Publisher) finish(ctx context.Context, c retrainClaim, next time.Time, status string, attempts int) {
+	if err := p.store.Done(ctx, p.peers.self, c.OrgID, c.Key, next, status, attempts); err != nil {
 		slog.Error("retrain finish", "metric_hash", c.Key, "err", err)
+		return
 	}
+	p.unhold(c.Key)
 }
 
 // fitHash trains over the last LOOKBACK and stores the snapshot. It is the only
@@ -612,8 +730,16 @@ func (p *Publisher) logTick(r tickResult) {
 		slog.Info("membership", "shard", p.peers.self, "mode", p.peers.mode, "peers", r.peers, "owned", r.owned)
 		p.lastPeers, p.lastOwned, p.countsLogged = r.peers, r.owned, true
 	}
+	if r.claimed > 0 {
+		// The tick line itself is debug, but the backlog must be visible on a
+		// healthy deployment: a fleet that is failing everything has to look
+		// different from one with nothing due.
+		slog.Info("retrain tick", "shard", p.peers.self,
+			"claimed", r.claimed, "retrained", r.retrained, "failed", r.failed)
+	}
 	slog.Debug("tick", "shard", p.peers.self, "peers", r.peers, "owned", r.owned,
-		"skipped", r.skipped, "ineligible", r.ineligible, "published", r.published, "retrained", r.retrained)
+		"skipped", r.skipped, "ineligible", r.ineligible, "published", r.published,
+		"claimed", r.claimed, "retrained", r.retrained, "failed", r.failed)
 }
 
 // eligible is the v1 rule that a hash needs a full training window before it is

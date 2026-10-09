@@ -23,7 +23,7 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - Depend on `timeseries.Series[float64]` and public `forecast.FitSeasonalBaseline`; do not fork Series or models
 - Public ops do not mutate caller series
 - Source of truth is Druid SQL, not the metrics Kafka topic
-- Stay within v1/v2/v3/v4/v5 unless `docs/INTENTIONS.md` is updated first
+- Stay within v1/v2/v3/v4/v5/v6 unless `docs/INTENTIONS.md` is updated first
 - Every Druid request is windowed and bounded (`DRUID_MAX_RANGE`, `DRUID_MAX_RPS`, `DRUID_MAX_INFLIGHT`, `DRUID_TIMEOUT`, `DRUID_RETRIES`) and one reply is capped at 64 MiB; never re-introduce an unbounded `SELECT`, a `COUNT(*)` pre-size probe or an unbounded `io.ReadAll`
 - A column the worker cannot read is never a zero: a null or unparseable `metric_value` is `NaN` and keeps its timestamp (the 1-minute check runs before the fit drops NaN), and a row it cannot place in time is dropped with a warning
 - The Kafka sink writes with `RequiredAcks: RequireAll`; a literal `kafka.Writer` would default to `RequireNone`, whose `Produce` returns `(nil, nil)`, making a broker-rejected record look published
@@ -52,7 +52,11 @@ Version the schema and make every primary key this repo owns a uuid. `migrations
 
 Collect the worker's own dead snapshots. `SNAPSHOT_TTL` (default `72h`, `0` disables, a positive value below `1h` is rejected) is the window after which the publisher tick deletes a `baselines.snapshots` row that nothing refreshed: its `updated_at` is older than the window **and** its `forecast.retrain` `baseline` row has no `last_run_at` inside it either (the owner-guarded `Done` writes a recent one on every finish, failure included, so an outage is not a dead metric). The sweep is one statement per tick, best effort (a failure is logged and the tick proceeds), and reads `forecast.retrain` only — that table stays the plugin's. It must exceed the retrain cadence, which `Validate` enforces at startup against `DEFAULT_RETRAIN_CRON`'s next gap; hence the 72h default beside the daily default cron. The plugin removes its own `forecast.snapshots` under `FORECAST_SNAPSHOT_TTL`.
 
-## v1/v2/v3/v4/v5 out of scope
+## v6 in scope
+
+Retrain reliability on the shared `forecast.retrain` queue: a `baseline` row left untrained by a worker that died is retrained by a survivor, a slow fit is never trained twice at once, and a broken row backs off instead of retrying in a storm. A claim is extended to `RETRAIN_LEASE` — derived as `max(RETRAIN_RETRY, ceil(LOOKBACK / DRUID_MAX_RANGE) × DRUID_TIMEOUT + 1m)`, 15m at the default shape — immediately before a row's fit, which then runs under a deadline equal to that lease; an extension matching zero rows means the claim moved to a newer owner, so that row is skipped without fitting or finishing it. A failed fit increments the row's persisted `attempts` column (added by the plugin's migration `0003_retrain_attempts.sql`, never by DDL here) and is due again after `min(RETRAIN_RETRY × 2^(attempts-1), RETRAIN_RETRY_MAX)` — the new cap defaults to `1h` and is rejected at startup when it is not longer than `RETRAIN_RETRY`; a success resets the count and schedules the next cron slot, and `last_status` carries `(attempt N)`. `SIGTERM` cancels the in-flight fits, releases every held claim with `next_run_at = now` and `last_status = 'error: interrupted'` (attempt count untouched), and the tick logs claimed/retrained/failed counts. A `forecast.retrain` without the `attempts` column fails loudly, naming `gpx_forecast_migrate`, instead of silently claiming nothing.
+
+## v1/v2/v3/v4/v5/v6 out of scope
 
 Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics Kafka, Docker/Helm packaging (see `timeseries-k8s`), a coordinator/leader election for ownership, backfill after a restart, an HTTP endpoint or health probe, more than one shared Postgres, a second migration tool (Flyway/goose/golang-migrate) or a schema-diff ORM, an integer surrogate key or `SERIAL`/sequence on a table this repo owns, and migrating another component's table (`forecast.retrain`).
 

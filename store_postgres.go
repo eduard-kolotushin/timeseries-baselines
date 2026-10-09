@@ -345,16 +345,16 @@ UPDATE forecast.retrain r
 SET claimed_by = $2, claimed_until = now() + $3::interval
 FROM due
 WHERE r.scope = due.scope AND r.org_id = due.org_id AND r.key = due.key
-RETURNING r.org_id, r.key, r.cron, r.timezone
+RETURNING r.org_id, r.key, r.cron, r.timezone, r.attempts
 `, limit, owner, lease)
 	if err != nil {
-		return nil, err
+		return nil, missingAttemptsError(err)
 	}
 	defer rows.Close()
 	out := make([]retrainClaim, 0, limit)
 	for rows.Next() {
 		var c retrainClaim
-		if err := rows.Scan(&c.OrgID, &c.Key, &c.Cron, &c.Timezone); err != nil {
+		if err := rows.Scan(&c.OrgID, &c.Key, &c.Cron, &c.Timezone, &c.Attempts); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -363,7 +363,14 @@ RETURNING r.org_id, r.key, r.cron, r.timezone
 }
 
 // Done releases the claim and sets when the row is next due. A failure passes
-// now+RETRAIN_RETRY as next, so a broken hash is retried instead of being lost.
+// now+retryDelay(RETRAIN_RETRY, RETRAIN_RETRY_MAX, attempts) as next, so a broken
+// hash is retried — spaced further out on every further failure — instead of being
+// lost or hammered.
+//
+// attempts is the row's new consecutive-failure count: 0 after a success, the
+// claim's previous count plus one after a failure, and the unchanged count for a
+// claim released at shutdown, because a deployment is not the row's failure. It is
+// written in the same statement as the outcome that produced it.
 //
 // Only the owner of the claim may finish it: a retrain that outlives its lease has
 // already been handed to another worker by the time it returns, and a stale
@@ -371,21 +378,59 @@ RETURNING r.org_id, r.key, r.cron, r.timezone
 // worker has released the claim itself, which is why the owner predicate is the
 // whole guard and a NULL claim is not a licence to write. Zero rows affected
 // therefore means the claim was lost, which is not an error.
-func (s *postgresStore) Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string) error {
+func (s *postgresStore) Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string, attempts int) error {
 	if err := s.ensure(ctx); err != nil {
 		return err
 	}
 	tag, err := s.pool.Exec(ctx, `
 UPDATE forecast.retrain
-SET next_run_at = $4, last_run_at = now(), last_status = $5,
+SET next_run_at = $4, last_run_at = now(), last_status = $5, attempts = $6,
     claimed_by = NULL, claimed_until = NULL
 WHERE scope = 'baseline' AND org_id = $3 AND key = $1 AND claimed_by = $2
-`, key, owner, orgID, next, status)
+`, key, owner, orgID, next, status, attempts)
 	if err != nil {
-		return err
+		return missingAttemptsError(err)
 	}
 	if tag.RowsAffected() == 0 {
 		slog.Debug("claim lost", "metric_hash", key, "owner", owner)
 	}
 	return nil
+}
+
+// Extend pushes this worker's lease on a held row out to now+lease and reports
+// whether it still owns it. The tick calls it immediately before a row's fit, so a
+// fit that takes longer than the lease it was claimed under cannot be re-claimed and
+// re-trained by a survivor at the same time — the duplicate scan is exactly the load
+// the fleet cannot afford.
+//
+// Like Done it is owner-guarded: only the claim holder may move the lease. Zero rows
+// updated means another worker owns the row now, which the caller treats as "skip
+// it", not as an error.
+func (s *postgresStore) Extend(ctx context.Context, owner string, orgID int64, key string, lease time.Duration) (bool, error) {
+	if err := s.ensure(ctx); err != nil {
+		return false, err
+	}
+	tag, err := s.pool.Exec(ctx, `
+UPDATE forecast.retrain
+SET claimed_until = now() + $4::interval
+WHERE scope = 'baseline' AND org_id = $3 AND key = $1 AND claimed_by = $2
+`, key, owner, orgID, lease)
+	if err != nil {
+		return false, missingAttemptsError(err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// missingAttemptsError names the one condition a forecast.retrain table from before
+// the plugin's attempts migration produces for a claim, an extend or a finish:
+// Postgres 42703 with ColumnName "attempts". Every tick would otherwise report one
+// generic undefined-column error and no row would ever be claimed, so the remedy the
+// operator can apply is named once instead. The column is the plugin's table's, so
+// this process never adds it.
+func missingAttemptsError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42703" && pgErr.ColumnName == "attempts" {
+		return fmt.Errorf("forecast.retrain has no attempts column: apply the timeseries-grafana migration (gpx_forecast_migrate) before starting this worker: %w", err)
+	}
+	return err
 }

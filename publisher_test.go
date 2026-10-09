@@ -3,6 +3,7 @@ package baselines
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -97,12 +98,19 @@ type fakeBackend struct {
 	due     []retrainClaim
 	putErr  error
 	hbErr   error
+	// extendLost makes Extend answer "another worker owns this row"; extendErr and
+	// doneErr make the store itself fail. The zero value means the extension
+	// succeeds, which is the state a test that does not care about the claim wants.
+	extendLost bool
+	extendErr  error
+	doneErr    error
 
 	mu        sync.Mutex
 	snaps     map[string]forecast.Snapshot
 	updated   map[string]time.Time
 	puts      []putCall
 	dones     []doneCall
+	extends   []extendCall
 	schedules []scheduleCall
 	claims    []claimCall
 	beats     []heartbeatCall
@@ -117,11 +125,19 @@ type putCall struct {
 }
 
 type doneCall struct {
-	owner  string
-	orgID  int64
-	key    string
-	next   time.Time
-	status string
+	owner    string
+	orgID    int64
+	key      string
+	next     time.Time
+	status   string
+	attempts int
+}
+
+type extendCall struct {
+	owner string
+	orgID int64
+	key   string
+	lease time.Duration
 }
 
 type scheduleCall struct {
@@ -211,11 +227,26 @@ func (f *fakeBackend) Claim(_ context.Context, owner string, lease time.Duration
 	return f.due, nil
 }
 
-func (f *fakeBackend) Done(_ context.Context, owner string, orgID int64, key string, next time.Time, status string) error {
+func (f *fakeBackend) Done(_ context.Context, owner string, orgID int64, key string, next time.Time, status string, attempts int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.dones = append(f.dones, doneCall{owner: owner, orgID: orgID, key: key, next: next, status: status})
+	if f.doneErr != nil {
+		return f.doneErr
+	}
+	f.dones = append(f.dones, doneCall{owner: owner, orgID: orgID, key: key, next: next, status: status, attempts: attempts})
 	return nil
+}
+
+// Extend answers "still owned" unless the test says otherwise, and records the call
+// so a test can pin both the claim-lost skip and the lease the tick extends with.
+func (f *fakeBackend) Extend(_ context.Context, owner string, orgID int64, key string, lease time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.extends = append(f.extends, extendCall{owner: owner, orgID: orgID, key: key, lease: lease})
+	if f.extendErr != nil {
+		return false, f.extendErr
+	}
+	return !f.extendLost, nil
 }
 
 func (f *fakeBackend) Heartbeat(_ context.Context, id string, owned, peers int) error {
@@ -601,7 +632,11 @@ func TestPublisherTrainsADueClaim(t *testing.T) {
 	end := time.Now().UTC().Truncate(time.Minute)
 	lookback := 3 * time.Hour
 	reader := readerWithHashes(end, 200, "ready")
-	backend := &fakeBackend{due: []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC"}}}
+	backend := &fakeBackend{due: []retrainClaim{{
+		Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC",
+		// Failures behind the row, so the success's reset is observable.
+		Attempts: 3,
+	}}}
 	sink := &fakeSink{}
 	cfg := Config{
 		Lookback:           lookback,
@@ -647,8 +682,13 @@ func TestPublisherTrainsADueClaim(t *testing.T) {
 	if len(claims) != 1 {
 		t.Fatalf("got %d claims %v, want one", len(claims), claims)
 	}
-	if claims[0].owner != "w0" || claims[0].lease != cfg.RetrainRetry || claims[0].limit != cfg.TrainConcurrency {
-		t.Fatalf("claimed as %+v, want owner w0 with lease %s and limit %d", claims[0], cfg.RetrainRetry, cfg.TrainConcurrency)
+	if claims[0].owner != "w0" || claims[0].lease != cfg.normalized().RetrainLease || claims[0].limit != cfg.TrainConcurrency {
+		t.Fatalf("claimed as %+v, want owner w0 with lease %s and limit %d", claims[0], cfg.normalized().RetrainLease, cfg.TrainConcurrency)
+	}
+	// The claim lease is the work lease, and each row is extended to it right before
+	// its fit, so a fit that takes longer than the claim's own window stays covered.
+	if extends := backend.extends; len(extends) != 1 || extends[0].lease != claims[0].lease || extends[0].key != "ready" {
+		t.Fatalf("extends %+v, want one for the claimed row at the work lease", backend.extends)
 	}
 
 	dones := backend.doneCalls()
@@ -660,6 +700,11 @@ func TestPublisherTrainsADueClaim(t *testing.T) {
 	}
 	if dones[0].status != "ok" {
 		t.Fatalf("finished with status %q, want ok", dones[0].status)
+	}
+	// The row had failures behind it: a success resets the counter, or it would keep
+	// backing off even after it started working again.
+	if dones[0].attempts != 0 {
+		t.Fatalf("finished attempts=%d, want the counter reset", dones[0].attempts)
 	}
 	if !dones[0].next.After(after) || dones[0].next.Sub(after) > 5*time.Minute || dones[0].next.Minute()%5 != 0 {
 		t.Fatalf("next run %s is not the next */5 minute after %s", dones[0].next, after)
@@ -1321,4 +1366,143 @@ func msgHashes(msgs []BaselineMessage) []string {
 		out = append(out, msg.MetricHash)
 	}
 	return out
+}
+
+// TestPublisherSkipsARowWhoseClaimMovedOn: the extension is what makes a refit safe,
+// and a false answer means a survivor took the row while this worker waited. The row
+// must be skipped outright — no Druid request, no snapshot, no finish that would
+// overwrite the new owner's next run, status and attempt count — because a duplicate
+// fit is the exact load amplification the extension exists to prevent.
+func TestPublisherSkipsARowWhoseClaimMovedOn(t *testing.T) {
+	t.Parallel()
+	end := time.Now().UTC().Truncate(time.Minute)
+	reader := readerWithHashes(end, 200, "ready")
+	backend := &fakeBackend{
+		due:        []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC"}},
+		extendLost: true,
+	}
+	p := newPublisher(Config{
+		Lookback:         3 * time.Hour,
+		AheadMinutes:     1,
+		ShardID:          "w0",
+		TrainConcurrency: 1,
+	}, reader, &fakeSink{}, nil, backend)
+
+	p.tick(context.Background())
+
+	if len(backend.extends) != 1 {
+		t.Fatalf("extend calls=%d, want the one claimed row", len(backend.extends))
+	}
+	if puts := backend.putCalls(); len(puts) != 0 {
+		t.Fatalf("fitted a row whose claim moved on: %v", puts)
+	}
+	if dones := backend.doneCalls(); len(dones) != 0 {
+		t.Fatalf("finished a row whose claim moved on: %v", dones)
+	}
+}
+
+// TestPublisherShutdownReleasesHeldClaims: a rolling restart must hand its claims back
+// instead of parking up to TRAIN_CONCURRENCY rows per worker for a whole lease. A row
+// leaves the held set only after the store accepts its finish, so the finish that failed
+// here is exactly what the release still covers — and the release runs even though the
+// context that woke it is already cancelled, with the attempt count untouched.
+func TestPublisherShutdownReleasesHeldClaims(t *testing.T) {
+	t.Parallel()
+	end := time.Now().UTC().Truncate(time.Minute)
+	reader := readerWithHashes(end, 200, "ready")
+	backend := &fakeBackend{
+		due:     []retrainClaim{{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC", Attempts: 2}},
+		doneErr: errors.New("store is down"),
+	}
+	p := newPublisher(Config{
+		Lookback:         3 * time.Hour,
+		AheadMinutes:     1,
+		ShardID:          "w0",
+		TrainConcurrency: 1,
+	}, reader, &fakeSink{}, nil, backend)
+
+	p.tick(context.Background())
+	if dones := backend.doneCalls(); len(dones) != 0 {
+		t.Fatalf("a rejected finish was recorded: %v", dones)
+	}
+
+	backend.doneErr = nil
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.releaseHeld(ctx)
+
+	dones := backend.doneCalls()
+	if len(dones) != 1 {
+		t.Fatalf("released %d claims, want one: %v", len(dones), dones)
+	}
+	if dones[0].status != "error: interrupted" {
+		t.Fatalf("released with status %q, want the interruption", dones[0].status)
+	}
+	if dones[0].owner != "w0" || dones[0].key != "ready" || dones[0].orgID != 0 {
+		t.Fatalf("released the wrong row: %+v", dones[0])
+	}
+	if dones[0].next.After(time.Now().UTC().Add(time.Second)) {
+		t.Fatalf("released at %s, want it due now", dones[0].next)
+	}
+	if dones[0].attempts != 2 {
+		t.Fatalf("release changed the attempt count to %d, want the row's own 2", dones[0].attempts)
+	}
+	// And it is gone from the held set: a second release must not write again.
+	p.releaseHeld(ctx)
+	if dones := backend.doneCalls(); len(dones) != 1 {
+		t.Fatalf("a second release wrote again: %v", dones)
+	}
+}
+
+// TestPublisherBacksOffFurtherOnEachFailure pins the retry spacing the attempt counter
+// drives: the first failure waits the base, a row with attempts behind it waits longer,
+// and a row that keeps failing settles at the cap instead of being retried at the base
+// forever — which is what turns a fleet-wide overload into a retry storm.
+func TestPublisherBacksOffFurtherOnEachFailure(t *testing.T) {
+	t.Parallel()
+	end := time.Now().UTC().Truncate(time.Minute)
+	reader := readerWithHashes(end, 200, "ready")
+	reader.seriErr = errors.New("druid is down")
+	const retry = 5 * time.Minute
+	for _, tc := range []struct {
+		name     string
+		attempts int
+		want     time.Duration
+	}{
+		{name: "a fresh row waits the base", attempts: 0, want: retry},
+		{name: "a row with two failures waits four bases", attempts: 2, want: 4 * retry},
+		{name: "a row that keeps failing waits the cap", attempts: 20, want: time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &fakeBackend{due: []retrainClaim{{
+				Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC", Attempts: tc.attempts,
+			}}}
+			p := newPublisher(Config{
+				Lookback:         3 * time.Hour,
+				AheadMinutes:     1,
+				ShardID:          "w0",
+				TrainConcurrency: 1,
+				RetrainRetry:     retry,
+				RetrainRetryMax:  time.Hour,
+			}, reader, &fakeSink{}, nil, backend)
+
+			before := time.Now().UTC()
+			p.tick(context.Background())
+			dones := backend.doneCalls()
+			if len(dones) != 1 {
+				t.Fatalf("got %d finishes %v, want one", len(dones), dones)
+			}
+			wantAttempts := tc.attempts + 1
+			if dones[0].attempts != wantAttempts {
+				t.Fatalf("attempts=%d, want %d", dones[0].attempts, wantAttempts)
+			}
+			if want := fmt.Sprintf("(attempt %d)", wantAttempts); !strings.Contains(dones[0].status, want) {
+				t.Fatalf("status %q does not name %s", dones[0].status, want)
+			}
+			want := before.Add(tc.want)
+			if dones[0].next.Before(want.Add(-time.Second)) || dones[0].next.After(want.Add(time.Second)) {
+				t.Fatalf("retry scheduled at %s, want about %s", dones[0].next, want)
+			}
+		})
+	}
 }

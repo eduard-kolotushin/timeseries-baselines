@@ -119,10 +119,28 @@ Collect the worker's own dead snapshots, so a retired metric does not keep its m
 - A separate retention process, cron entry, or HTTP surface
 - Sweeping or replicating the plugin's `forecast.snapshots`
 
+## v6 must-have
+
+Retrain reliability: a baseline left untrained by a worker that died is retrained by a survivor, a slow fit is never trained twice at once, and a broken row backs off instead of retrying in a storm.
+
+- **At-least-once, never abandoned.** A due `baseline` row is retrained by exactly one claim holder, and bookkeeping never advances a claim past its lease: an unfinished claim (a crash, a `SIGTERM`, a network partition) is re-admitted to any worker once `claimed_until < now()` and the row is still due, because a claim does not touch `next_run_at` and the claim predicate never requires a particular owner. The hashes a dead worker held, and the ones it never reached, are therefore retrained by the survivors — no handshake, no coordinator, and no hash waits on a specific process
+- **The lease covers the work it protects.** Immediately before a row's work starts, its claim is extended to `now() + RETRAIN_LEASE` and the fit runs under a deadline equal to that lease, so one fit can neither outlive its claim (and be re-claimed and re-trained concurrently by a survivor, duplicating the heaviest Druid scans exactly when the fleet is loaded) nor be cut short. The default lease is derived from the work, not picked: `max(RETRAIN_RETRY, ceil(LOOKBACK / DRUID_MAX_RANGE) × DRUID_TIMEOUT + 1m)` — 15m at `LOOKBACK=336h`, `DRUID_MAX_RANGE=24h`, `DRUID_TIMEOUT=60s`. An extension that matches zero rows means the claim was handed to a newer owner: that row is dropped without fitting it and without finishing it, so the new owner's `next_run_at`/`last_status` are never overwritten
+- **Retries are bounded in rate, never given up.** A failed retrain increments the row's persisted `attempts` count and is due again after `min(RETRAIN_RETRY × 2^(attempts-1), RETRAIN_RETRY_MAX)`, cap default `1h` (a cap not longer than `RETRAIN_RETRY` is rejected at startup). A success resets the count to `0` and schedules the next cron slot, so a permanently broken hash settles at one retry per hour instead of one per tick cycle forever, and its attempt count is written to `last_status` (`error: … (attempt N)`) and the logs. There is no dead-letter queue and no disable-after-N-failures: the plugin's `/schedules` API owns disabling and deleting a row. A row the scan says is ineligible is a failure like any other (it burns an attempt) because it did run
+- **Graceful handover.** On `SIGTERM` the in-flight fits are cancelled and every claim still held is released with `next_run_at = now` and `last_status = 'error: interrupted'`, so a rolling restart costs no lease-length wait; the attempt count is left alone, because a deployment is not the row's failure. A release that loses the row to a newer owner is the owner-guarded `Done`'s zero-row case, not an error
+- **The backlog is observable, and a pre-v6 table fails loudly.** Each tick logs the rows claimed, retrained and failed, and the per-hash failure log carries the attempt count. The `attempts` column belongs to the plugin's table, so this repo never adds it: a claim against a table without it fails with an error naming the fix (`gpx_forecast_migrate`) rather than silently claiming nothing — the same contract as the per-org key
+
+## v6 non-goals
+
+- A dead-letter queue, a disable-after-N-failures path, or a retry backoff that is not the capped exponential one above. A permanently broken hash is retried at the cap until an operator disables or deletes its row through the plugin's `/schedules`
+- A coordinator or leader election, a heartbeat-driven claim release, or any state shared with the plugin beyond the one table: the lease is the whole recovery mechanism
+- DDL against `forecast.retrain`, or a second migration for it: `timeseries-grafana` creates and owns that table and its migrations
+- A second scheduler, a new process, or an HTTP surface
+
 ## Quality bar
 
 - Do not mutate caller series (libraries already return new series)
 - Table-driven tests for config, Druid windows / limits / retry, publisher ticks (scan → retrain → emit), snapshot cache reuse, retrain scheduling, and shard membership (partition, coverage, hash spread, peer-source modes)
+- Table-driven tests for the retry backoff curve and the claim protocol: lease reclaim by a survivor, the claim-lost skip (no fit, no finish), and the shutdown release of held claims
 - One O(n) fit per hash per retrain; O(1) per horizon step; pre-size series slices to the window length
 - Ownership hashing must not allocate per hash: no joined `hash|peer` string
 - Dependencies stay minimal: `github.com/robfig/cron/v3` for the 5-field schedule and `github.com/jackc/pgx/v5` for the store, on top of `timeseries`, `timeseries-forecast`, and `kafka-go`
