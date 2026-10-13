@@ -62,8 +62,8 @@ make deps-report   # -> .gate-cache/deps-report.md
 ```
 
 One row per module: the version the build resolves, and whether that version is a `tag`, a
-`pseudo`-version (the upstream publishes no tagged release at all — here that is
-`github.com/jackc/pgservicefile`), or an `incompatible` tag (a release that predates Go modules, such
+`pseudo`-version (the upstream publishes no tagged release at all — `github.com/jackc/pgservicefile`
+and `gopkg.in/check.v1` here), or an `incompatible` tag (a release that predates Go modules, such
 as `v2.1.0+incompatible`; this graph has none). A `pseudo` row with 0 upstream tagged releases cannot
 be pinned to a tag by any consumer; moving one means changing the shared module graph, which is a
 separate change with its own verification. Attach the report to the security ticket.
