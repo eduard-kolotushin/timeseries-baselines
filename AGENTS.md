@@ -9,7 +9,7 @@ Standalone Druid → minute-of-week baseline → Kafka worker. Not a Grafana plu
 - **Module:** `github.com/eduard-kolotushin/timeseries-baselines`
 - **Package:** `baselines`
 - **Go:** 1.26+
-- **Libraries:** tagged `timeseries` and `timeseries-forecast` modules (no `replace`)
+- **Libraries:** tagged `timeseries` and `timeseries-forecast` modules (no `replace`); builds resolve them through the company Go proxy — see [docs/COMPANY-BUILD.md](docs/COMPANY-BUILD.md)
 - **Sandbox:** sibling `timeseries-grafana-sandbox` runs this as Compose `baseline-worker`
 - **Kubernetes:** sibling `timeseries-k8s` builds the worker image from a git pin of this repo
 
@@ -65,5 +65,6 @@ Grafana hosting, overlay UI, Prometheus, prediction intervals, consuming metrics
 - Table-driven tests next to the code under test
 - Depend on tagged `timeseries` and `timeseries-forecast` modules; do not add a `replace` directive
 - `make linux` writes `bin/baselines` for the sandbox container; `make migrate` writes `bin/baselines-migrate`, the CI/CD entry point for the schema
+- `make gate-check` re-runs the CI Go steps from a cold module cache behind the configured proxy; `make deps-report` writes the module inventory for a security review ([docs/COMPANY-BUILD.md](docs/COMPANY-BUILD.md))
 - Do not copy Series internals; use the public timeseries API only
 - GitHub Actions on `main`: `gofmt` and `go test -race ./...` against a `postgres:17` service (`BASELINE_TEST_PG`), the linux worker and migrator builds, and the migration CLI run against that service
