@@ -1454,6 +1454,62 @@ func TestPublisherShutdownReleasesHeldClaims(t *testing.T) {
 	}
 }
 
+// TestPublisherShutdownReleasesClaimsItNeverStarted: a shutdown that lands while the tick is
+// still waiting for a fit slot — SIGTERM inside the claim→acquire window, or more claims than
+// TRAIN_CONCURRENCY — must hand the un-started claims back too. They are claimed by this
+// process, so without the release they wait out the whole lease before any worker may take them.
+func TestPublisherShutdownReleasesClaimsItNeverStarted(t *testing.T) {
+	t.Parallel()
+	end := time.Now().UTC().Truncate(time.Minute)
+	reader := readerWithHashes(end, 200, "ready", "queued")
+	backend := &fakeBackend{
+		due: []retrainClaim{
+			{Key: "ready", Cron: "*/5 * * * *", Timezone: "UTC", Attempts: 2},
+			{Key: "queued", Cron: "*/5 * * * *", Timezone: "UTC", Attempts: 0},
+		},
+	}
+	p := newPublisher(Config{
+		Lookback:         3 * time.Hour,
+		AheadMinutes:     1,
+		ShardID:          "w0",
+		TrainConcurrency: 1,
+	}, reader, &fakeSink{}, nil, backend)
+
+	// Fill the one fit slot before the tick: acquire's select then has a full channel and a
+	// cancelled context, so exactly one case is ready and the shutdown is deterministic
+	// instead of a coin flip between taking the slot and observing the cancellation.
+	releaseSlot, err := p.trainSem.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("fill the fit pool: %v", err)
+	}
+	defer releaseSlot()
+
+	// A cancelled context fails the very first acquire, so no claim reaches a goroutine.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	p.retrain(ctx, []string{"ready", "queued"}, end)
+
+	done, doneCancel := context.WithCancel(context.Background())
+	defer doneCancel()
+	p.releaseHeld(done)
+
+	dones := backend.doneCalls()
+	if len(dones) != 2 {
+		t.Fatalf("released %d claims, want both un-started ones: %v", len(dones), dones)
+	}
+	for _, d := range dones {
+		if d.status != "error: interrupted" {
+			t.Fatalf("released %q with status %q, want the interruption", d.key, d.status)
+		}
+		if d.owner != "w0" {
+			t.Fatalf("released %q with owner %q, want w0", d.key, d.owner)
+		}
+		if d.next.After(time.Now().UTC().Add(time.Second)) {
+			t.Fatalf("released %s at %s, want it due now", d.key, d.next)
+		}
+	}
+}
+
 // TestPublisherBacksOffFurtherOnEachFailure pins the retry spacing the attempt counter
 // drives: the first failure waits the base, a row with attempts behind it waits longer,
 // and a row that keeps failing settles at the cap instead of being retried at the base

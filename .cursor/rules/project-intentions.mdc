@@ -7,9 +7,9 @@ alwaysApply: true
 
 Read [docs/INTENTIONS.md](docs/INTENTIONS.md) before expanding scope.
 
-## Stay in v1/v2/v3/v4/v5
+## Stay in v1/v2/v3/v4/v5/v6
 
-Allowed: Druid SQL scan, minute-of-week `FitSeasonalBaseline`, one Kafka message per ready hash per tick (at minute-truncated `now` + `AHEAD_MINUTES` from a stored snapshot; at last+N minutes without a store), env config, the Postgres snapshot/retrain/membership store, and the embedded versioned migrations.
+Allowed: Druid SQL scan, minute-of-week `FitSeasonalBaseline`, one Kafka message per ready hash per tick (at minute-truncated `now` + `AHEAD_MINUTES` from a stored snapshot; at last+N minutes without a store), env config, the Postgres snapshot/retrain/membership store, and the embedded versioned migrations. v6 — retrain reliability on the shared `forecast.retrain` queue: a claim leased for `RETRAIN_LEASE` and extended again immediately before each fit, a lost claim skipped without fitting or finishing, failures backing off `min(RETRAIN_RETRY × 2^(attempts-1), RETRAIN_RETRY_MAX)`, SIGTERM cancelling the in-flight fits and releasing every held claim, and a `forecast.retrain` without the plugin's `attempts` column failing the schedule store loudly.
 
 Do **not** add without updating INTENTIONS first:
 
@@ -21,6 +21,7 @@ Do **not** add without updating INTENTIONS first:
 - A forked Series type
 - Consuming the metrics Kafka topic
 - A second migration tool or an ORM, a `SERIAL`/integer surrogate key, an HTTP surface, a coordinator, or DDL against `forecast.retrain` (the plugin's table)
+- A dead-letter queue or a disable-after-N rule (v6 keeps a broken row backing off, never parked)
 
 ## Optimize computation as you implement
 

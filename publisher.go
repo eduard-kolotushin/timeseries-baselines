@@ -307,6 +307,13 @@ func (p *Publisher) retrain(ctx context.Context, keys []string, now time.Time) r
 		wg sync.WaitGroup
 		mu sync.Mutex
 	)
+	// Held as claimed, before any slot is taken: a shutdown that lands anywhere inside the
+	// pool loop — waiting on a slot, or after the break below — must find every claim no
+	// goroutine took in the held set, or those rows wait out the whole lease before any
+	// worker may take them again. A started goroutine unholds its claim when its finish lands.
+	for _, claim := range claims {
+		p.hold(claim)
+	}
 	for _, claim := range claims {
 		// Bounded goroutine pool: TRAIN_CONCURRENCY fits at a time, and the claim
 		// limit matches the pool so a tick never claims work it cannot start.
@@ -314,7 +321,6 @@ func (p *Publisher) retrain(ctx context.Context, keys []string, now time.Time) r
 		if err != nil {
 			break
 		}
-		p.hold(claim)
 		wg.Add(1)
 		go func(c retrainClaim) {
 			defer wg.Done()
