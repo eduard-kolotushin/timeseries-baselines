@@ -115,7 +115,7 @@ Collect the worker's own dead snapshots, so a retired metric does not keep its m
 
 ## v5 non-goals
 
-- Deleting a model on explicit user intent, or reconciling `forecast.retrain` rows against snapshots: the plugin's schedule API owns both
+- Deleting a model on explicit user intent, or reconciling `forecast.retrain` rows against snapshots: the plugin's schedule API owns both. (v7 adds the worker's own stale-metric retirement, which is a lifecycle event, not a reconciliation of the two tables)
 - A separate retention process, cron entry, or HTTP surface
 - Sweeping or replicating the plugin's `forecast.snapshots`
 
@@ -135,6 +135,23 @@ Retrain reliability: a baseline left untrained by a worker that died is retraine
 - A coordinator or leader election, a heartbeat-driven claim release, or any state shared with the plugin beyond the one table: the lease is the whole recovery mechanism
 - DDL against `forecast.retrain`, or a second migration for it: `timeseries-grafana` creates and owns that table and its migrations
 - A second scheduler, a new process, or an HTTP surface
+
+## v7 must-have
+
+Retire a baseline whose metric went stale, so a retired metric keeps neither a published lead, nor a trained model, nor a retry loop — only its history in Druid.
+
+- **`STALE_AFTER`** (default `24h`, `0` disables) is the freshness window, measured as `now - span.Max` from the scan. A hash is **alive** only while its span is eligible (covers `LOOKBACK`) **and** it has been seen within `STALE_AFTER`. Retraining (`readyKeys`), scheduling and publishing (`emit`, `fitForecast`) use that one predicate, so a stale hash stops being published and scheduled at the same tick that it stops being alive
+- **Retirement, on a fresh scan only.** Every tick with a successful scan whose cache is still inside `HASH_SCAN_TTL` reads the existing `scope='baseline'`, `org_id=0` rows and deletes, in one transaction, the snapshot (`baselines.snapshots`) and the row (`forecast.retrain`) of every key the scan no longer carries or whose span failed the liveness test. A failed refresh, an empty scan reply, or `STALE_AFTER=0` retires nothing: the span set a failed refresh keeps is not a basis for a fleet-wide delete, and an empty datasource is not the same statement as an empty result
+- **Wake-up needs no path of its own.** The scan re-discovers a returning hash, `Schedule` re-inserts its row (`ON CONFLICT DO NOTHING`), and the next claim trains it. A hash absent for longer than `SCAN_RANGE` is re-trained only once its new span covers `LOOKBACK` again, which is the v3 span rule, not a retirement rule
+- **Races are already covered.** A fit in flight when its row is deleted finishes against zero rows (the owner-guarded `Done`), and a snapshot a late `Put` recreates is collected by `SNAPSHOT_TTL`, because a deleted row leaves no `last_run_at` behind
+- This amends v5's non-goal (the worker now deletes its own baseline rows) and v6's "only reads, claims and finishes rows": it still never creates DDL against `forecast.retrain` and never touches another scope, org, or the plugin's `forecast.snapshots`
+
+## v7 non-goals
+
+- Retiring on explicit user intent: the plugin's `/schedules` API still owns disable and delete
+- A tombstone, a retired flag, a history table, or a "reactivate" endpoint: deletion is the retirement, and a returning metric is a new row
+- Retiring while the scan is unproven (a failed refresh's cached set, an empty reply, an unavailable store)
+- Changing the fit window or adding a wake-up backfill: a returning hash is trained on the last `LOOKBACK` like any other
 
 ## Quality bar
 

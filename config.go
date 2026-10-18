@@ -41,6 +41,12 @@ const (
 	// defaultSnapshotTTL is three daily retrain cycles, so a healthy metric is
 	// never collected by the sweep while a metric that stopped reporting is.
 	defaultSnapshotTTL = 72 * time.Hour
+
+	// defaultStaleAfter is how long a hash may go unseen before it stops being
+	// alive: far beyond any plausible ingest lag, and short enough that a retired
+	// metric's hourly retry and model last a day, not the two weeks a scan-window
+	// rule would take to forget it.
+	defaultStaleAfter = 24 * time.Hour
 )
 
 var datasourceName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
@@ -103,6 +109,14 @@ type Config struct {
 	// built in code carries whatever the caller set.
 	SnapshotTTL time.Duration
 
+	// StaleAfter is the freshness window a hash must be seen within to stay
+	// alive: a hash whose scan span ends earlier is neither trained, scheduled
+	// nor published, and the tick retires its forecast.retrain row and its
+	// snapshot. 0 disables retirement (and the freshness half of the liveness
+	// test); ConfigFromEnv defaults it to 24h, and normalized leaves the field
+	// alone because 0 is a real setting.
+	StaleAfter time.Duration
+
 	// Sharding. Empty ShardPeers and ShardDNS mean one worker owns every hash.
 	// ShardID defaults to the first non-loopback IP (ShardID in shard.go).
 	// ShardMembership selects the source: auto resolves to peers, dns, store or
@@ -116,8 +130,8 @@ type Config struct {
 }
 
 // ConfigFromEnv reads DRUID_*, KAFKA_*, LOOKBACK, AHEAD_MINUTES, INTERVAL,
-// CALENDAR, SHARD_*, LOG_LEVEL, SNAPSHOT_TTL, RETRAIN_* (the retry base, the work
-// lease and the retry cap) and the BASELINE_STORE_* DSN.
+// CALENDAR, SHARD_*, LOG_LEVEL, SNAPSHOT_TTL, STALE_AFTER, RETRAIN_* (the retry
+// base, the work lease and the retry cap) and the BASELINE_STORE_* DSN.
 func ConfigFromEnv() (Config, error) {
 	cfg := Config{
 		DruidBroker:        strings.TrimSpace(os.Getenv("DRUID_BROKER")),
@@ -146,6 +160,7 @@ func ConfigFromEnv() (Config, error) {
 		LogLevel:           "info",
 		StoreDSN:           storeDSN(os.Getenv),
 		SnapshotTTL:        defaultSnapshotTTL,
+		StaleAfter:         defaultStaleAfter,
 	}
 	if cfg.DruidDatasource == "" {
 		cfg.DruidDatasource = defaultDatasource
@@ -176,6 +191,7 @@ func ConfigFromEnv() (Config, error) {
 		{"RETRAIN_LEASE", &cfg.RetrainLease},
 		{"RETRAIN_RETRY_MAX", &cfg.RetrainRetryMax},
 		{"SNAPSHOT_TTL", &cfg.SnapshotTTL},
+		{"STALE_AFTER", &cfg.StaleAfter},
 	}
 	for _, d := range durations {
 		v, ok, err := envDuration(d.name)
@@ -307,6 +323,11 @@ func (c Config) Validate() error {
 		// healthy metric is still being refreshed into; 0 is the explicit "off".
 		return fmt.Errorf("SNAPSHOT_TTL must be at least 1h (or 0 to disable the sweep)")
 	}
+	if c.StaleAfter < 0 {
+		// 0 is the explicit off switch for retirement; a negative window would make
+		// every hash stale and delete the fleet on the first tick.
+		return fmt.Errorf("STALE_AFTER must not be negative")
+	}
 	if c.LogLevel != "" && c.LogLevel != "info" && c.LogLevel != "debug" {
 		return fmt.Errorf("LOG_LEVEL must be info or debug")
 	}
@@ -336,9 +357,9 @@ func (c Config) SlogLevel() slog.Level {
 // normalized fills the fields where an unset value has a default, so a Config
 // built in code behaves like one read from the environment — except the fields
 // where zero is a real setting (DRUID_MAX_RANGE, DRUID_RETRIES, DRUID_MAX_RPS,
-// LOG_LEVEL, SNAPSHOT_TTL), which are left alone: for those, ConfigFromEnv is
-// what supplies the deployed default, and SNAPSHOT_TTL = 0 keeps meaning "off"
-// however the Config was built.
+// LOG_LEVEL, SNAPSHOT_TTL, STALE_AFTER), which are left alone: for those,
+// ConfigFromEnv is what supplies the deployed default, and SNAPSHOT_TTL = 0 /
+// STALE_AFTER = 0 keep meaning "off" however the Config was built.
 func (c Config) normalized() Config {
 	if c.DruidTimeout <= 0 {
 		c.DruidTimeout = defaultDruidTimeout

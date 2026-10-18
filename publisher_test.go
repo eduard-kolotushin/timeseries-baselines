@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -104,6 +105,12 @@ type fakeBackend struct {
 	extendLost bool
 	extendErr  error
 	doneErr    error
+	// Retire scripting: baselineKeys is the row set BaselineKeys returns (nil by
+	// default, so a Config with StaleAfter unset retires nothing), and the two
+	// errors make each half of the retirement path fail.
+	baselineKeys []string
+	baselineErr  error
+	retireErr    error
 
 	mu        sync.Mutex
 	snaps     map[string]forecast.Snapshot
@@ -115,8 +122,10 @@ type fakeBackend struct {
 	claims    []claimCall
 	beats     []heartbeatCall
 	sweeps    []time.Duration
+	retires   [][]string
 	freshRead int
 	getRead   int
+	keyRead   int
 }
 
 type putCall struct {
@@ -263,6 +272,38 @@ func (f *fakeBackend) SweepSnapshots(_ context.Context, ttl time.Duration) (int6
 	return 0, nil
 }
 
+// BaselineKeys answers the scripted row set; a test that sets it models the
+// forecast.retrain rows the worker would see on a real store.
+func (f *fakeBackend) BaselineKeys(context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.keyRead++
+	if f.baselineErr != nil {
+		return nil, f.baselineErr
+	}
+	return append([]string(nil), f.baselineKeys...), nil
+}
+
+// Retire records the keys it was asked to delete and removes the matching
+// scripted snapshots, so a test can assert both the request and the state the
+// fake is left in.
+func (f *fakeBackend) Retire(_ context.Context, keys []string) (snapshots, rows int64, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retires = append(f.retires, append([]string(nil), keys...))
+	if f.retireErr != nil {
+		return 0, 0, f.retireErr
+	}
+	for _, key := range keys {
+		if _, ok := f.snaps[key]; ok {
+			delete(f.snaps, key)
+			delete(f.updated, key)
+			snapshots++
+		}
+	}
+	return snapshots, int64(len(keys)), nil
+}
+
 func (f *fakeBackend) Peers(context.Context, time.Duration) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -306,6 +347,36 @@ func (f *fakeBackend) sweepCalls() []time.Duration {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]time.Duration(nil), f.sweeps...)
+}
+
+// retireCalls is every Retire request in tick order, each a copy of its keys.
+func (f *fakeBackend) retireCalls() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]string, len(f.retires))
+	for i, keys := range f.retires {
+		out[i] = append([]string(nil), keys...)
+	}
+	return out
+}
+
+// keyReads is how many times the tick listed the baseline rows.
+func (f *fakeBackend) keyReads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.keyRead
+}
+
+// snapshotKeys is the snapshot set the fake store holds now, sorted by key.
+func (f *fakeBackend) snapshotKeys() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.snaps))
+	for key := range f.snaps {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // readCounts is how many freshness queries and snapshot reads the store served.
@@ -580,6 +651,269 @@ func TestPublisherSkipsIneligibleHashesOnTheStorePath(t *testing.T) {
 			}
 			if len(p.fitted) != len(tc.wantPublish) {
 				t.Fatalf("cached %d fits, want %d: an ineligible hash must not hold a fit", len(p.fitted), len(tc.wantPublish))
+			}
+		})
+	}
+}
+
+// alive is the v7 liveness rule: eligible and seen within staleAfter. The
+// boundary is inclusive — a span ending exactly at now-staleAfter is alive, and
+// it is stale only when strictly older.
+func TestAlive(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	const lookback = 2 * time.Hour
+	spanEnding := func(maxAgo time.Duration) metricSpan {
+		max := now.Add(-maxAgo)
+		return metricSpan{Hash: "hash", Min: max.Add(-3 * time.Hour), Max: max}
+	}
+	for _, tc := range []struct {
+		name       string
+		span       metricSpan
+		staleAfter time.Duration
+		want       bool
+	}{
+		{"fresh and eligible", spanEnding(time.Minute), time.Hour, true},
+		{"fresh exactly at the window", spanEnding(time.Hour), time.Hour, true},
+		{"one second past the window", spanEnding(time.Hour + time.Second), time.Hour, false},
+		{"disabled keeps an aged but eligible span", spanEnding(30 * 24 * time.Hour), 0, true},
+		{"ineligible but fresh", metricSpan{Hash: "hash", Min: now.Add(-time.Hour), Max: now}, time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := alive(tc.span, lookback, tc.staleAfter, now); got != tc.want {
+				t.Fatalf("alive = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// retiredKeys diffs the rows against the scan: a key the scan no longer carries
+// is retired, and so is one whose span is too short or too old. Input order is
+// preserved, so the DELETE and its log line read deterministically.
+func TestRetiredKeys(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	const (
+		lookback   = 2 * time.Hour
+		staleAfter = time.Hour
+	)
+	spans := []metricSpan{
+		{Hash: "alive", Min: now.Add(-3 * time.Hour), Max: now.Add(-time.Minute)},
+		{Hash: "stale", Min: now.Add(-5 * time.Hour), Max: now.Add(-2 * time.Hour)},
+		{Hash: "short", Min: now.Add(-30 * time.Minute), Max: now},
+	}
+	for _, tc := range []struct {
+		name     string
+		existing []string
+		staleOff bool
+		want     []string
+	}{
+		{
+			name:     "an absent key and a non-alive span are retired, an alive key is kept",
+			existing: []string{"alive", "stale", "gone", "short"},
+			want:     []string{"stale", "gone", "short"},
+		},
+		{
+			name:     "only the absent key is retired when the rest are alive",
+			existing: []string{"alive", "gone"},
+			want:     []string{"gone"},
+		},
+		{
+			name:     "freshness disabled retires only absent and ineligible keys",
+			existing: []string{"alive", "stale", "gone", "short"},
+			staleOff: true,
+			want:     []string{"gone", "short"},
+		},
+		{
+			name:     "an empty table retires nothing",
+			existing: nil,
+			want:     nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stale := staleAfter
+			if tc.staleOff {
+				stale = 0
+			}
+			got := retiredKeys(spans, tc.existing, lookback, stale, now)
+			if strings.Join(got, ",") != strings.Join(tc.want, ",") {
+				t.Fatalf("retired %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A stale hash is retired on the tick that sees it: its row and model go, it is
+// neither scheduled nor published, and the tick reports the deletion.
+func TestPublisherRetiresStaleBaselines(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	reader := &fakeReader{
+		spans: []metricSpan{
+			{Hash: "alive", Min: now.Add(-3 * time.Hour), Max: now.Add(-time.Minute)},
+			// 3h of history (eligible) whose last point is two hours old.
+			{Hash: "stale", Min: now.Add(-5 * time.Hour), Max: now.Add(-2 * time.Hour)},
+		},
+	}
+	reader.noSeries = true
+	backend := &fakeBackend{baselineKeys: []string{"alive", "stale", "gone"}}
+	backend.seedFit(t, "alive", fitPoints(t, minutePoints(now, 181)), now)
+	backend.seedFit(t, "stale", fitPoints(t, minutePoints(now.Add(-2*time.Hour), 181)), now.Add(-2*time.Hour))
+	backend.seedFit(t, "gone", fitPoints(t, minutePoints(now.Add(-3*time.Hour), 181)), now.Add(-3*time.Hour))
+	sink := &fakeSink{}
+	p := newPublisher(Config{
+		Lookback:     2 * time.Hour,
+		AheadMinutes: 1,
+		Interval:     time.Minute,
+		ShardID:      "w0",
+		StaleAfter:   time.Hour,
+	}, reader, sink, nil, backend)
+	p.now = func() time.Time { return now }
+
+	res, ok := p.runTick(context.Background())
+	if !ok {
+		t.Fatal("tick failed")
+	}
+	if res.retired != 2 {
+		t.Fatalf("retired %d rows, want 2", res.retired)
+	}
+	calls := backend.retireCalls()
+	if len(calls) != 1 {
+		t.Fatalf("Retire called %d times, want 1: %#v", len(calls), calls)
+	}
+	if got, want := strings.Join(calls[0], ","), "stale,gone"; got != want {
+		t.Fatalf("retired %q, want %q (input order)", got, want)
+	}
+	if got, want := strings.Join(backend.snapshotKeys(), ","), "alive"; got != want {
+		t.Fatalf("snapshots left %q, want %q", got, want)
+	}
+	var scheduled []string
+	for _, call := range backend.scheduleCalls() {
+		scheduled = append(scheduled, call.keys...)
+	}
+	if got, want := strings.Join(scheduled, ","), "alive"; got != want {
+		t.Fatalf("scheduled %q, want %q", got, want)
+	}
+	var published []string
+	for _, msg := range sink.msgs {
+		published = append(published, msg.MetricHash)
+	}
+	if got, want := strings.Join(published, ","), "alive"; got != want {
+		t.Fatalf("published %q, want %q", got, want)
+	}
+}
+
+// Retirement needs a scan it can trust: a successful refresh inside its TTL with
+// a non-empty reply, and the feature left on. Each guard keeps a different
+// accident from deleting rows — an outage's cached spans, a datasource that
+// answered nothing, or a Config built in code without the window.
+func TestPublisherRetirementNeedsAProvenScan(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		// cfg mutates the base config; spans seeds the reader; keys seed the table.
+		cfg   func(*Config)
+		spans []metricSpan
+		keys  []string
+		// expire makes the test take a second tick after the scan cache has
+		// expired, with the refresh failing: the cached spans must not retire.
+		expire       bool
+		baselineErr  error
+		retireErr    error
+		wantKeyReads int
+		wantRetires  int
+		wantRetired  int
+	}{
+		{
+			name:         "disabled by STALE_AFTER=0",
+			cfg:          func(c *Config) { c.StaleAfter = 0 },
+			spans:        []metricSpan{{Hash: "hash", Min: now.Add(-3 * time.Hour), Max: now}},
+			keys:         []string{"hash"},
+			wantRetires:  0,
+			wantRetired:  0,
+			wantKeyReads: 0,
+		},
+		{
+			name:         "an empty scan reply proves nothing",
+			cfg:          func(c *Config) { c.StaleAfter = time.Hour },
+			spans:        nil,
+			keys:         []string{"hash"},
+			wantRetires:  0,
+			wantRetired:  0,
+			wantKeyReads: 0,
+		},
+		{
+			name:         "a failed refresh does not retire from its cached spans",
+			cfg:          func(c *Config) { c.StaleAfter = time.Hour },
+			spans:        []metricSpan{{Hash: "alive", Min: now.Add(-3 * time.Hour), Max: now.Add(-time.Minute)}},
+			keys:         []string{"alive"},
+			expire:       true,
+			wantRetires:  0,
+			wantRetired:  0,
+			wantKeyReads: 1,
+		},
+		{
+			name:         "a failing row list is logged and skips retirement",
+			cfg:          func(c *Config) { c.StaleAfter = time.Hour },
+			spans:        []metricSpan{{Hash: "alive", Min: now.Add(-3 * time.Hour), Max: now.Add(-time.Minute)}},
+			keys:         []string{"alive"},
+			baselineErr:  errors.New("store down"),
+			wantRetires:  0,
+			wantRetired:  0,
+			wantKeyReads: 1,
+		},
+		{
+			name:         "a failing delete leaves the rows for the next tick",
+			cfg:          func(c *Config) { c.StaleAfter = time.Hour },
+			spans:        []metricSpan{{Hash: "alive", Min: now.Add(-3 * time.Hour), Max: now.Add(-time.Minute)}},
+			keys:         []string{"gone"},
+			retireErr:    errors.New("store down"),
+			wantRetires:  1,
+			wantRetired:  0,
+			wantKeyReads: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := now
+			reader := &fakeReader{spans: tc.spans}
+			backend := &fakeBackend{
+				baselineKeys: tc.keys,
+				baselineErr:  tc.baselineErr,
+				retireErr:    tc.retireErr,
+			}
+			sink := &fakeSink{}
+			cfg := Config{
+				Lookback:     2 * time.Hour,
+				AheadMinutes: 1,
+				Interval:     time.Minute,
+				ShardID:      "w0",
+			}
+			tc.cfg(&cfg)
+			p := newPublisher(cfg, reader, sink, nil, backend)
+			p.now = func() time.Time { return clock }
+
+			res, ok := p.runTick(context.Background())
+			if !ok {
+				t.Fatal("tick failed")
+			}
+			if res.retired != tc.wantRetired {
+				t.Fatalf("retired %d rows, want %d", res.retired, tc.wantRetired)
+			}
+			if tc.expire {
+				// The scan cache has run out and the refresh fails: the tick falls
+				// back to the last good spans, which are not proof of anything.
+				clock = clock.Add(p.cfg.HashScanTTL + time.Minute)
+				reader.hashErr = errors.New("druid down")
+				if _, ok := p.runTick(context.Background()); !ok {
+					t.Fatal("second tick failed")
+				}
+			}
+			if got := backend.keyReads(); got != tc.wantKeyReads {
+				t.Fatalf("listed baseline rows %d times, want %d", got, tc.wantKeyReads)
+			}
+			if got := len(backend.retireCalls()); got != tc.wantRetires {
+				t.Fatalf("Retire called %d times, want %d", got, tc.wantRetires)
 			}
 		})
 	}

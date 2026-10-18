@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eduard-kolotushin/timeseries"
 	forecast "github.com/eduard-kolotushin/timeseries-forecast"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -746,5 +747,273 @@ func TestMissingAttemptsError(t *testing.T) {
 	}
 	if got := missingAttemptsError(context.Canceled); got != context.Canceled {
 		t.Fatalf("err=%v, want it passed through", got)
+	}
+}
+
+// TestPostgresRetire: a retired key loses both sides in one transaction — the
+// model in baselines.snapshots and the row in forecast.retrain — and only for
+// the fleet-wide baseline scope. A panel row, another org's row and any key not
+// named in the call survive, and a second call is a no-op.
+func TestPostgresRetire(t *testing.T) {
+	s, ctx := openTestStore(t)
+	ensurePluginRetrainTable(t, s)
+	stamp := strconv.FormatInt(time.Now().UnixNano(), 10)
+	var (
+		staleKey = "baselines-retire-stale-" + stamp
+		aliveKey = "baselines-retire-alive-" + stamp
+		panelKey = "baselines-retire-panel-" + stamp
+	)
+	keys := []string{staleKey, aliveKey, panelKey}
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM baselines.snapshots WHERE metric_hash = ANY($1)`, keys)
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM forecast.retrain WHERE key = ANY($1)`, keys)
+	})
+	seedSnapshot := func(key string) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, `
+INSERT INTO baselines.snapshots (metric_hash, model, season, calendar, lookback_ms, trained_at, snapshot, updated_at)
+VALUES ($1, 'baseline', 'minute-week', '', 1209600000, now(), $2, now())
+`, key, []byte{0x1f, 0x8b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedRow := func(scope string, orgID int64, key string) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, `
+INSERT INTO forecast.retrain (scope, org_id, key, cron, timezone, enabled, next_run_at)
+VALUES ($1, $2, $3, '0 3 * * *', 'UTC', true, now() + interval '1 hour')
+ON CONFLICT (scope, org_id, key) DO UPDATE SET next_run_at = EXCLUDED.next_run_at
+`, scope, orgID, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedSnapshot(staleKey)
+	seedSnapshot(aliveKey)
+	seedSnapshot(panelKey)
+	seedRow("baseline", 0, staleKey)
+	seedRow("baseline", 0, aliveKey)
+	seedRow("panel", 1, panelKey)
+
+	// "missing" is in the call but not in either table: the counts are what was
+	// actually deleted, not the size of the request.
+	snapshots, rows, err := s.Retire(ctx, []string{staleKey, "baselines-retire-missing-" + stamp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshots != 1 || rows != 1 {
+		t.Fatalf("deleted snapshots=%d rows=%d, want 1 and 1", snapshots, rows)
+	}
+	for _, tc := range []struct {
+		name string
+		q    string
+		key  string
+		want bool
+	}{
+		{"snapshot stale", `SELECT EXISTS (SELECT 1 FROM baselines.snapshots WHERE metric_hash = $1)`, staleKey, false},
+		{"row stale", `SELECT EXISTS (SELECT 1 FROM forecast.retrain WHERE scope = 'baseline' AND org_id = 0 AND key = $1)`, staleKey, false},
+		{"snapshot alive", `SELECT EXISTS (SELECT 1 FROM baselines.snapshots WHERE metric_hash = $1)`, aliveKey, true},
+		{"row alive", `SELECT EXISTS (SELECT 1 FROM forecast.retrain WHERE scope = 'baseline' AND org_id = 0 AND key = $1)`, aliveKey, true},
+		{"snapshot panel", `SELECT EXISTS (SELECT 1 FROM baselines.snapshots WHERE metric_hash = $1)`, panelKey, true},
+		{"row panel", `SELECT EXISTS (SELECT 1 FROM forecast.retrain WHERE scope = 'panel' AND org_id = 1 AND key = $1)`, panelKey, true},
+	} {
+		var exists bool
+		if err := s.pool.QueryRow(ctx, tc.q, tc.key).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if exists != tc.want {
+			t.Fatalf("%s %s exists=%v, want %v", tc.name, tc.key, exists, tc.want)
+		}
+	}
+	if snapshots, rows, err := s.Retire(ctx, []string{staleKey}); err != nil || snapshots != 0 || rows != 0 {
+		t.Fatalf("second Retire deleted snapshots=%d rows=%d err=%v, want 0, 0, nil (idempotent)", snapshots, rows, err)
+	}
+
+	// BaselineKeys is the retire diff's row set: both fleet-wide baseline rows,
+	// never a panel row, and no deleted key.
+	listed, err := s.BaselineKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := make(map[string]struct{}, len(listed))
+	for _, k := range listed {
+		set[k] = struct{}{}
+	}
+	if _, ok := set[aliveKey]; !ok {
+		t.Fatalf("BaselineKeys omitted %s", aliveKey)
+	}
+	if _, ok := set[staleKey]; ok {
+		t.Fatalf("BaselineKeys still lists the retired %s", staleKey)
+	}
+	if _, ok := set[panelKey]; ok {
+		t.Fatalf("BaselineKeys listed a panel row (%s)", panelKey)
+	}
+}
+
+// TestPublisherRetiresAndWakesUp is the v7 lifecycle end to end against the real
+// store: a baseline row whose metric is absent from a proven scan is retired with
+// its model, and when the metric returns the same unchanged tick path re-creates
+// the row and retrains it.
+//
+// Other baseline rows in the database are parked as not-due for the duration —
+// the claim is fleet-wide — and the retire tick is given an alive span for each of
+// them, so a shared test database keeps its rows. The wake-up tick disables the
+// freshness half of the predicate (StaleAfter = 0) rather than inventing spans
+// for unrelated rows: distribution is already unit-tested, and this test is about
+// the store round trip.
+func TestPublisherRetiresAndWakesUp(t *testing.T) {
+	s, ctx := openTestStore(t)
+	ensurePluginRetrainTable(t, s)
+	now := time.Now().UTC().Truncate(time.Minute)
+	key := "baselines-wakeup-" + strconv.FormatInt(now.UnixNano(), 10)
+	anchor := key + "-short"
+	t.Cleanup(func() {
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM baselines.snapshots WHERE metric_hash = $1`, key)
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM forecast.retrain WHERE key = $1`, key)
+	})
+
+	// The fixture is what an hourly retry of a retired hash leaves behind: a row
+	// with a failure status and a model, both pinned by last_run_at.
+	if _, err := s.pool.Exec(ctx, `
+INSERT INTO forecast.retrain (scope, org_id, key, cron, timezone, enabled, next_run_at, last_run_at, last_status, attempts)
+VALUES ('baseline', 0, $1, '0 3 * * *', 'UTC', true, now() + interval '1 hour', now(), 'error: no data in the last 336h0m0s (attempt 9)', 9)
+ON CONFLICT (scope, org_id, key) DO UPDATE SET
+  next_run_at = EXCLUDED.next_run_at, last_run_at = EXCLUDED.last_run_at,
+  last_status = EXCLUDED.last_status, attempts = EXCLUDED.attempts, claimed_by = NULL, claimed_until = NULL
+`, key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+INSERT INTO baselines.snapshots (metric_hash, model, season, calendar, lookback_ms, trained_at, snapshot, updated_at)
+VALUES ($1, 'baseline', 'minute-week', '', 1209600000, now(), $2, now())
+ON CONFLICT (metric_hash) DO UPDATE SET updated_at = now()
+`, key, []byte{0x1f, 0x8b}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Park every other due baseline row: the tick claims fleet-wide, and a test
+	// must not retrain a row it did not create. Restored as "due now" afterwards,
+	// which is the state it was in.
+	parkedRows, err := s.pool.Query(ctx, `
+UPDATE forecast.retrain SET next_run_at = now() + interval '1 day'
+WHERE scope = 'baseline' AND org_id = 0 AND key <> $1 AND next_run_at <= now()
+RETURNING key
+`, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parked []string
+	for parkedRows.Next() {
+		var k string
+		if err := parkedRows.Scan(&k); err != nil {
+			parkedRows.Close()
+			t.Fatal(err)
+		}
+		parked = append(parked, k)
+	}
+	parkedRows.Close()
+	if err := parkedRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if len(parked) == 0 {
+			return
+		}
+		_, _ = s.pool.Exec(context.Background(), `
+UPDATE forecast.retrain SET next_run_at = now()
+WHERE scope = 'baseline' AND org_id = 0 AND key = ANY($1)
+`, parked)
+	}()
+
+	// Every existing baseline row gets an alive span except the fixture, so the
+	// retire diff touches exactly the key this test owns.
+	existing, err := s.BaselineKeys(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spans := []metricSpan{{Hash: anchor, Min: now.Add(-10 * time.Minute), Max: now}}
+	for _, k := range existing {
+		if k == key {
+			continue
+		}
+		spans = append(spans, metricSpan{Hash: k, Min: now.Add(-3 * time.Hour), Max: now.Add(-time.Minute)})
+	}
+
+	reader := &fakeReader{spans: spans}
+	sink := &fakeSink{}
+	cfg := Config{
+		Lookback:     2 * time.Hour,
+		AheadMinutes: 1,
+		Interval:     time.Minute,
+		ShardID:      "store-wakeup",
+		ShardPeers:   []string{"store-wakeup"},
+		StaleAfter:   time.Hour,
+	}
+	p := newPublisher(cfg, reader, sink, nil, s)
+	clock := now
+	p.now = func() time.Time { return clock }
+
+	if _, ok := p.runTick(context.Background()); !ok {
+		t.Fatal("retire tick failed")
+	}
+	var (
+		rowExists  bool
+		snapExists bool
+	)
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM forecast.retrain WHERE scope = 'baseline' AND org_id = 0 AND key = $1)`, key).Scan(&rowExists); err != nil {
+		t.Fatal(err)
+	}
+	if rowExists {
+		t.Fatal("the stale row survived the retire tick")
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM baselines.snapshots WHERE metric_hash = $1)`, key).Scan(&snapExists); err != nil {
+		t.Fatal(err)
+	}
+	if snapExists {
+		t.Fatal("the stale model survived the retire tick")
+	}
+
+	// The metric returns: the scan carries it again and the unchanged Schedule
+	// path re-creates the row, which the same tick trains.
+	clock = clock.Add(p.cfg.HashScanTTL + time.Minute)
+	reader.spans = []metricSpan{{Hash: key, Min: now.Add(-3 * time.Hour), Max: now.Add(-time.Minute)}}
+	reader.points = map[string][]timeseries.Point[float64]{key: minutePoints(now, 181)}
+	p.cfg.StaleAfter = 0
+
+	res, ok := p.runTick(context.Background())
+	if !ok {
+		t.Fatal("wake-up tick failed")
+	}
+	if res.retrained != 1 {
+		t.Fatalf("retrained %d rows, want the returning hash", res.retrained)
+	}
+	var (
+		rows       int
+		cron       string
+		lastStatus *string
+		nextDue    bool
+	)
+	if err := s.pool.QueryRow(ctx, `
+SELECT count(*), min(cron), min(last_status), bool_or(next_run_at <= now())
+FROM forecast.retrain WHERE scope = 'baseline' AND org_id = 0 AND key = $1
+`, key).Scan(&rows, &cron, &lastStatus, &nextDue); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || cron != defaultRetrainCron {
+		t.Fatalf("wake-up left rows=%d cron=%q, want one row with %q", rows, cron, defaultRetrainCron)
+	}
+	if lastStatus == nil || *lastStatus != "ok" {
+		t.Fatalf("wake-up status %v, want ok", lastStatus)
+	}
+	// A successful finish schedules the next cron slot, so the row is no longer
+	// due: the "due now" state belongs to the insert, and the tick that follows it
+	// is what retrains.
+	if nextDue {
+		t.Fatal("a retrained row is still due now; Done must schedule the next cron slot")
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM baselines.snapshots WHERE metric_hash = $1)`, key).Scan(&snapExists); err != nil {
+		t.Fatal(err)
+	}
+	if !snapExists {
+		t.Fatal("the returning metric was not trained into a snapshot")
 	}
 }

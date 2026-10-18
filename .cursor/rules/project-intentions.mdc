@@ -7,9 +7,9 @@ alwaysApply: true
 
 Read [docs/INTENTIONS.md](docs/INTENTIONS.md) before expanding scope.
 
-## Stay in v1/v2/v3/v4/v5/v6
+## Stay in v1/v2/v3/v4/v5/v6/v7
 
-Allowed: Druid SQL scan, minute-of-week `FitSeasonalBaseline`, one Kafka message per ready hash per tick (at minute-truncated `now` + `AHEAD_MINUTES` from a stored snapshot; at last+N minutes without a store), env config, the Postgres snapshot/retrain/membership store, and the embedded versioned migrations. v6 — retrain reliability on the shared `forecast.retrain` queue: a claim leased for `RETRAIN_LEASE` and extended again immediately before each fit, a lost claim skipped without fitting or finishing, failures backing off `min(RETRAIN_RETRY × 2^(attempts-1), RETRAIN_RETRY_MAX)`, SIGTERM cancelling the in-flight fits and releasing every held claim, and a `forecast.retrain` without the plugin's `attempts` column failing the schedule store loudly.
+Allowed: Druid SQL scan, minute-of-week `FitSeasonalBaseline`, one Kafka message per ready hash per tick (at minute-truncated `now` + `AHEAD_MINUTES` from a stored snapshot; at last+N minutes without a store), env config, the Postgres snapshot/retrain/membership store, and the embedded versioned migrations. v6 — retrain reliability on the shared `forecast.retrain` queue: a claim leased for `RETRAIN_LEASE` and extended again immediately before each fit, a lost claim skipped without fitting or finishing, failures backing off `min(RETRAIN_RETRY × 2^(attempts-1), RETRAIN_RETRY_MAX)`, SIGTERM cancelling the in-flight fits and releasing every held claim, and a `forecast.retrain` without the plugin's `attempts` column failing the schedule store loudly. v7 — stale-baseline retirement: `STALE_AFTER` (default `24h`, `0` disables) makes a hash alive only while eligible and seen within the window, and a tick with a fresh successful scan deletes the `baselines.snapshots` model and the `forecast.retrain` `baseline` row of every key that is absent from the scan or no longer alive (one transaction, never on a failed refresh or an empty reply); a returning metric is re-discovered and re-scheduled.
 
 Do **not** add without updating INTENTIONS first:
 

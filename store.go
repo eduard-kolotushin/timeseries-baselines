@@ -45,6 +45,14 @@ type retrainQueue interface {
 	Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string, attempts int) error
 }
 
+// retireStore removes a baseline that is no longer alive: its model and its row.
+// BaselineKeys is the row set the tick diffs against the scan; Retire deletes
+// both sides of one key in one transaction and is idempotent.
+type retireStore interface {
+	BaselineKeys(ctx context.Context) ([]string, error)
+	Retire(ctx context.Context, keys []string) (snapshots, rows int64, err error)
+}
+
 // membership is the Postgres heartbeat that replaces static peer discovery on
 // VMs: the peer set is the ids seen within ttl.
 type membership interface {
@@ -57,6 +65,7 @@ type membership interface {
 type storeBackend interface {
 	snapshotStore
 	retrainQueue
+	retireStore
 	membership
 	Close()
 }

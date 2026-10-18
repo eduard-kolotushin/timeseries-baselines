@@ -32,6 +32,7 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "")
 	t.Setenv("SHARD_MEMBERSHIP", "")
 	t.Setenv("SNAPSHOT_TTL", "")
+	t.Setenv("STALE_AFTER", "")
 	clearStoreEnv(t)
 	cfg, err := ConfigFromEnv()
 	if err != nil {
@@ -58,11 +59,17 @@ func TestConfigFromEnvDefaults(t *testing.T) {
 	if cfg.SnapshotTTL != 72*time.Hour {
 		t.Fatalf("SNAPSHOT_TTL default %s, want 72h", cfg.SnapshotTTL)
 	}
+	if cfg.StaleAfter != 24*time.Hour {
+		t.Fatalf("STALE_AFTER default %s, want 24h", cfg.StaleAfter)
+	}
 	// 0 is the documented off switch, so normalized must not fill it in for a
 	// code-built Config: doing that would turn an explicit SNAPSHOT_TTL=0 back on
 	// in every deployment, because NewPublisher normalizes the env config too.
 	if got := (Config{SnapshotTTL: 0}).normalized(); got.SnapshotTTL != 0 {
 		t.Fatalf("normalized turned the sweep back on: %s", got.SnapshotTTL)
+	}
+	if got := (Config{StaleAfter: 0}).normalized(); got.StaleAfter != 0 {
+		t.Fatalf("normalized turned retirement back on: %s", got.StaleAfter)
 	}
 	if cfg.LogLevel != "info" || cfg.SlogLevel().String() != "INFO" {
 		t.Fatalf("log level: %q %s", cfg.LogLevel, cfg.SlogLevel())
@@ -120,6 +127,7 @@ func TestConfigFromEnvValues(t *testing.T) {
 	t.Setenv("DEFAULT_RETRAIN_CRON", "*/5 * * * *")
 	t.Setenv("RETRAIN_RETRY", "90s")
 	t.Setenv("SNAPSHOT_TTL", "48h")
+	t.Setenv("STALE_AFTER", "2h")
 	t.Setenv("SHARD_MEMBERSHIP", "store")
 	t.Setenv("LOG_LEVEL", "DEBUG")
 	clearStoreEnv(t)
@@ -155,6 +163,9 @@ func TestConfigFromEnvValues(t *testing.T) {
 	if cfg.SnapshotTTL != 48*time.Hour {
 		t.Fatalf("SNAPSHOT_TTL: %s, want 48h", cfg.SnapshotTTL)
 	}
+	if cfg.StaleAfter != 2*time.Hour {
+		t.Fatalf("STALE_AFTER: %s, want 2h", cfg.StaleAfter)
+	}
 	if cfg.ShardMembership != "store" || cfg.StoreDSN == "" {
 		t.Fatalf("store membership: %+v", cfg)
 	}
@@ -178,6 +189,7 @@ func TestConfigFromEnvErrors(t *testing.T) {
 		{"DRUID_MAX_RANGE", "soon", "DRUID_MAX_RANGE"},
 		{"SCAN_RANGE", "forever", "SCAN_RANGE"},
 		{"SNAPSHOT_TTL", "a while", "SNAPSHOT_TTL"},
+		{"STALE_AFTER", "a while", "STALE_AFTER"},
 		{"TRAIN_CONCURRENCY", "many", "TRAIN_CONCURRENCY"},
 		{"DRUID_RETRIES", "lots", "DRUID_RETRIES"},
 	} {
@@ -257,6 +269,9 @@ func TestConfigValidate(t *testing.T) {
 		}, "SNAPSHOT_TTL"},
 		{"snapshot ttl above the daily retrain cadence", func(c *Config) { c.SnapshotTTL = 72 * time.Hour }, ""},
 		{"snapshot ttl disabled under a daily cadence", func(c *Config) { c.SnapshotTTL = 0 }, ""},
+		{"negative stale after", func(c *Config) { c.StaleAfter = -time.Minute }, "STALE_AFTER"},
+		{"stale after disabled", func(c *Config) { c.StaleAfter = 0 }, ""},
+		{"stale after set", func(c *Config) { c.StaleAfter = 2 * time.Hour }, ""},
 		{"log level", func(c *Config) { c.LogLevel = "trace" }, "LOG_LEVEL"},
 		{"membership mode", func(c *Config) { c.ShardMembership = "etcd" }, "SHARD_MEMBERSHIP"},
 		{"store membership without a store", func(c *Config) { c.ShardMembership = "store" }, "SHARD_MEMBERSHIP=store"},

@@ -237,6 +237,68 @@ func (s *postgresStore) probeSchema(ctx context.Context) error {
 	return nil
 }
 
+// BaselineKeys lists the fleet-wide baseline rows this worker may retire. It
+// reads only the key column: the tick diffs the set against its scan, so any
+// other column would be dead weight on a per-tick query.
+func (s *postgresStore) BaselineKeys(ctx context.Context) ([]string, error) {
+	if err := s.ensure(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, `SELECT key FROM forecast.retrain WHERE scope = 'baseline' AND org_id = 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0, 64)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		out = append(out, key)
+	}
+	return out, rows.Err()
+}
+
+// Retire deletes the baseline side of every key in one transaction: the fitted
+// model in baselines.snapshots and the schedule row in forecast.retrain. The two
+// statements are one unit because a row without a model would keep being claimed
+// and a model without a row would be unreachable (and only collected by
+// SNAPSHOT_TTL); a crash between them is exactly the state the next tick's
+// retirement repeats, which is why the method is idempotent and returns the
+// counts it actually deleted. It does not filter claimed_until: a fit in flight
+// when its row is deleted finishes against zero rows (Done is owner-guarded by
+// claimed_by), and a snapshot such a late Put re-creates is collected by
+// SNAPSHOT_TTL, because the row that would stamp last_run_at is gone.
+func (s *postgresStore) Retire(ctx context.Context, keys []string) (snapshots, rows int64, err error) {
+	if len(keys) == 0 {
+		return 0, 0, nil
+	}
+	if err := s.ensure(ctx); err != nil {
+		return 0, 0, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	snapTag, err := tx.Exec(ctx, `DELETE FROM baselines.snapshots WHERE metric_hash = ANY($1)`, keys)
+	if err != nil {
+		return 0, 0, err
+	}
+	rowTag, err := tx.Exec(ctx, `
+DELETE FROM forecast.retrain
+WHERE scope = 'baseline' AND org_id = 0 AND key = ANY($1)
+`, keys)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, err
+	}
+	return snapTag.RowsAffected(), rowTag.RowsAffected(), nil
+}
+
 func (s *postgresStore) Heartbeat(ctx context.Context, id string, owned, peers int) error {
 	if err := s.ensure(ctx); err != nil {
 		return err

@@ -81,6 +81,9 @@ type tickResult struct {
 	// tick line shows a backlog draining instead of only what succeeded.
 	claimed int
 	failed  int
+	// retired is how many baseline rows this tick removed together with their
+	// snapshots: a key the scan no longer carries or one that stopped being alive.
+	retired int
 }
 
 func newPublisher(cfg Config, src metricReader, sink baselineSink, cal *forecast.Calendar, store storeBackend) *Publisher {
@@ -186,13 +189,15 @@ func (p *Publisher) runTick(ctx context.Context) (tickResult, bool) {
 	owned := ownedSpans(spans, p.peers.self, peers)
 	keys := ownedKeys(spans, owned)
 	p.heartbeat(ctx, len(keys), len(peers))
+	retired := p.retire(ctx, spans, now)
 	p.sweep(ctx)
-	ready := readyKeys(spans, owned, p.cfg.Lookback)
+	ready := readyKeys(spans, owned, p.cfg.Lookback, p.cfg.StaleAfter, now)
 	res := tickResult{
 		peers:      len(peers),
 		owned:      len(keys),
 		skipped:    len(spans) - len(keys),
 		ineligible: len(keys) - len(ready),
+		retired:    retired,
 	}
 	counts := p.retrain(ctx, ready, now)
 	res.claimed = counts.claimed
@@ -239,6 +244,39 @@ func (p *Publisher) heartbeat(ctx context.Context, owned, peers int) {
 		return
 	}
 	p.hbWarned = false
+}
+
+// retire removes baseline rows and models whose metric is no longer alive. It
+// runs only on a fresh successful scan: the cached span set a failed refresh
+// leaves behind would otherwise retire the whole fleet during a Druid outage,
+// and an empty reply is a datasource that answered nothing, not a statement that
+// every metric is gone. It is best effort like the sweep — a store error is
+// logged and the rest of the tick proceeds — and it runs before the schedule
+// insert and the claim, so a key it retires is not re-created in the same tick.
+func (p *Publisher) retire(ctx context.Context, spans []metricSpan, now time.Time) int {
+	if p.store == nil || p.cfg.StaleAfter <= 0 {
+		return 0
+	}
+	if !p.scanOK || now.Sub(p.scanAt) >= p.cfg.HashScanTTL || len(spans) == 0 {
+		return 0
+	}
+	existing, err := p.store.BaselineKeys(ctx)
+	if err != nil {
+		slog.Warn("baseline keys", "err", err)
+		return 0
+	}
+	keys := retiredKeys(spans, existing, p.cfg.Lookback, p.cfg.StaleAfter, now)
+	if len(keys) == 0 {
+		return 0
+	}
+	snapshots, rows, err := p.store.Retire(ctx, keys)
+	if err != nil {
+		slog.Warn("retire baselines", "keys", len(keys), "err", err)
+		return 0
+	}
+	slog.Info("retired baselines", "shard", p.peers.self,
+		"keys", len(keys), "snapshots", snapshots, "rows", rows)
+	return int(rows)
 }
 
 // sweep collects the snapshots nothing refreshed within SnapshotTTL whose
@@ -522,8 +560,10 @@ func (p *Publisher) emit(ctx context.Context, spans []metricSpan, keys []string,
 		}
 		// A stored snapshot is not an entitlement to publish: a hash whose
 		// history is shorter than LOOKBACK (or shrank to less than it) must not
-		// keep a fresh-looking lead alive from a fit it should never have had.
-		if !eligible(span, p.cfg.Lookback) {
+		// keep a fresh-looking lead alive from a fit it should never have had,
+		// and one that stopped reporting must stop at the freshness window rather
+		// than at the tick its row is retired.
+		if !alive(span, p.cfg.Lookback, p.cfg.StaleAfter, now) {
 			continue
 		}
 		ok := false
@@ -582,7 +622,7 @@ func (p *Publisher) emitSnapshot(ctx context.Context, key string, ts time.Time) 
 // after the data. It costs one Druid request per owned hash per tick, which is
 // what snapshots exist to avoid.
 func (p *Publisher) fitForecast(ctx context.Context, span metricSpan, now time.Time) bool {
-	if !eligible(span, p.cfg.Lookback) {
+	if !alive(span, p.cfg.Lookback, p.cfg.StaleAfter, now) {
 		return false
 	}
 	s, err := p.src.Series(ctx, span.Hash, span.Max.Add(-p.cfg.Lookback), now)
@@ -745,7 +785,8 @@ func (p *Publisher) logTick(r tickResult) {
 	}
 	slog.Debug("tick", "shard", p.peers.self, "peers", r.peers, "owned", r.owned,
 		"skipped", r.skipped, "ineligible", r.ineligible, "published", r.published,
-		"claimed", r.claimed, "retrained", r.retrained, "failed", r.failed)
+		"claimed", r.claimed, "retrained", r.retrained, "failed", r.failed,
+		"retired", r.retired)
 }
 
 // eligible is the v1 rule that a hash needs a full training window before it is
@@ -755,6 +796,17 @@ func (p *Publisher) logTick(r tickResult) {
 // instead of all time.
 func eligible(span metricSpan, lookback time.Duration) bool {
 	return span.Max.Sub(span.Min) >= lookback
+}
+
+// alive reports whether a hash is still a baseline this fleet should train and
+// publish: long enough for a fit, and seen within staleAfter. staleAfter <= 0
+// disables the freshness half (the pre-v7 behaviour), so a Config built in code
+// without it keeps the old loop exactly.
+func alive(span metricSpan, lookback, staleAfter time.Duration, now time.Time) bool {
+	if !eligible(span, lookback) {
+		return false
+	}
+	return staleAfter <= 0 || !span.Max.Before(now.Add(-staleAfter))
 }
 
 // ownedSpans reports, per span, whether this worker owns the hash. The tick
@@ -786,12 +838,35 @@ func ownedKeys(spans []metricSpan, owned []bool) []string {
 // that carries the eligibility check: fitForecast's gate covers the no-store
 // loop only, so without this the store turned every scanned hash into a trained,
 // published series and a hash with days of history was published like any other.
-func readyKeys(spans []metricSpan, owned []bool, lookback time.Duration) []string {
+// Liveness (eligible and seen within staleAfter) is the v7 half: a hash that
+// stopped reporting is neither scheduled nor published while its row is retired.
+func readyKeys(spans []metricSpan, owned []bool, lookback, staleAfter time.Duration, now time.Time) []string {
 	out := make([]string, 0, len(spans))
 	for i, span := range spans {
-		if owned[i] && eligible(span, lookback) {
+		if owned[i] && alive(span, lookback, staleAfter, now) {
 			out = append(out, span.Hash)
 		}
+	}
+	return out
+}
+
+// retiredKeys returns the existing baseline keys that are no longer alive: a key
+// the scan no longer carries at all (nothing is publishing it any more) or one
+// whose span failed the liveness test (too short, or not seen within staleAfter).
+// The rows are the loop, so the result is bounded by the table rather than by the
+// scan, and input order is preserved so a test and the log line read
+// deterministically.
+func retiredKeys(spans []metricSpan, existing []string, lookback, staleAfter time.Duration, now time.Time) []string {
+	seen := make(map[string]metricSpan, len(spans))
+	for _, span := range spans {
+		seen[span.Hash] = span
+	}
+	out := make([]string, 0, len(existing))
+	for _, key := range existing {
+		if span, ok := seen[key]; ok && alive(span, lookback, staleAfter, now) {
+			continue
+		}
+		out = append(out, key)
 	}
 	return out
 }
