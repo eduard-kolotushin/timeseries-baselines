@@ -30,6 +30,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
+          # setup-go exports GOTOOLCHAIN=local, so the module's toolchain
+          # directive cannot download a newer patch; resolve the current stable
+          # 1.26 release here instead (1.26.10 carries the stdlib fixes).
+          check-latest: true
       - name: Format
         run: test -z "$(gofmt -l .)"
       - name: Test
