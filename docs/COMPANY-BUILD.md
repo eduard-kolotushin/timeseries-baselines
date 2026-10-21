@@ -34,6 +34,14 @@ Credentials belong in the `GOPROXY` userinfo (`https://user:token@host`) or in `
 this repo. If the company proxy cannot reach `sum.golang.org`, set `GOSUMDB=off` or point it at the
 internal sumdb; `go.sum` still verifies every module, so nothing is lost.
 
+**Toolchains and `GOSUMDB=off`.** The module declares no `toolchain` line, and that is deliberate: a
+toolchain download is verified through the checksum database, so with `GOSUMDB=off` the go command
+refuses it with `verifying module: checksum database disabled by GOSUMDB=off`. `GONOSUMDB` does not
+exempt the `golang.org/toolchain` module (checked with both the path pattern and `*`). Install Go 1.26.10
+or newer; the build then uses that toolchain and downloads nothing. CI installs the latest 1.26 patch
+(`check-latest`) and the Kubernetes image floats on `golang:1.26-bookworm`; `govulncheck` fails on an
+older patch (GO-2026-6809 on 1.26.9 is the concrete case).
+
 If validation is an intercepting HTTP proxy rather than a Go module proxy, leave `GOPROXY` at its
 default and set `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`. `make gate-check` prints the effective settings
 and works either way.
