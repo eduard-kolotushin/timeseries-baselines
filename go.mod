@@ -2,6 +2,8 @@ module github.com/eduard-kolotushin/timeseries-baselines
 
 go 1.26.0
 
+toolchain go1.26.10
+
 require (
 	github.com/eduard-kolotushin/timeseries v0.2.0
 	github.com/eduard-kolotushin/timeseries-forecast v0.5.3
