@@ -380,9 +380,12 @@ func staleScheduleKeyError(err error) error {
 	return err
 }
 
-// Claim takes up to limit due baseline rows and leases them to owner. SKIP
-// LOCKED lets every worker run this statement concurrently without a
-// coordinator, and claimed_until is how a claim comes back after a crash.
+// Claim takes up to limit due baseline rows and leases them to owner. Only the
+// fleet-wide org 0 is claimed: a baseline row under another org is not this
+// worker's (BaselineKeys and Retire scope to org 0 too, so claiming one would
+// retrain it forever without ever retiring it). SKIP LOCKED lets every worker
+// run this statement concurrently without a coordinator, and claimed_until is
+// how a claim comes back after a crash.
 //
 // A superseded row is never claimed: the plugin marks a schedule that a newer key
 // replaced with superseded_at, and both claims skip it so neither side retrains a
@@ -395,6 +398,7 @@ func (s *postgresStore) Claim(ctx context.Context, owner string, lease time.Dura
 WITH due AS (
   SELECT scope, org_id, key FROM forecast.retrain
   WHERE scope = 'baseline'
+    AND org_id = 0
     AND enabled
     AND next_run_at IS NOT NULL
     AND next_run_at <= now()
