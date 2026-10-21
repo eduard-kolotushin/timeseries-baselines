@@ -1,6 +1,6 @@
 module github.com/eduard-kolotushin/timeseries-baselines
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/eduard-kolotushin/timeseries v0.2.0
@@ -16,6 +16,6 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.15.9 // indirect
 	github.com/pierrec/lz4/v4 v4.1.15 // indirect
-	golang.org/x/sync v0.17.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
