@@ -272,6 +272,19 @@ func TestConfigValidate(t *testing.T) {
 		{"negative stale after", func(c *Config) { c.StaleAfter = -time.Minute }, "STALE_AFTER"},
 		{"stale after disabled", func(c *Config) { c.StaleAfter = 0 }, ""},
 		{"stale after set", func(c *Config) { c.StaleAfter = 2 * time.Hour }, ""},
+		{"stale after shorter than the scan cache", func(c *Config) {
+			// A cached scan would report a live hash as stale before the next scan.
+			c.HashScanTTL = 5 * time.Minute
+			c.StaleAfter = 5 * time.Minute
+		}, "STALE_AFTER"},
+		{"stale after one interval past the scan cache", func(c *Config) {
+			c.HashScanTTL = 5 * time.Minute
+			c.StaleAfter = 6 * time.Minute
+		}, ""},
+		{"stale after below the default scan cache", func(c *Config) {
+			// HashScanTTL 0 means the 5m default; 1m still cannot cover it.
+			c.StaleAfter = time.Minute
+		}, "STALE_AFTER"},
 		{"log level", func(c *Config) { c.LogLevel = "trace" }, "LOG_LEVEL"},
 		{"membership mode", func(c *Config) { c.ShardMembership = "etcd" }, "SHARD_MEMBERSHIP"},
 		{"store membership without a store", func(c *Config) { c.ShardMembership = "store" }, "SHARD_MEMBERSHIP=store"},

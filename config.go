@@ -114,7 +114,9 @@ type Config struct {
 	// nor published, and the tick retires its forecast.retrain row and its
 	// snapshot. 0 disables retirement (and the freshness half of the liveness
 	// test); ConfigFromEnv defaults it to 24h, and normalized leaves the field
-	// alone because 0 is a real setting.
+	// alone because 0 is a real setting. A positive value must be at least
+	// HASH_SCAN_TTL + INTERVAL: the scan set is reused for the whole cache
+	// window, so a shorter one would judge a still-reporting hash stale.
 	StaleAfter time.Duration
 
 	// Sharding. Empty ShardPeers and ShardDNS mean one worker owns every hash.
@@ -327,6 +329,20 @@ func (c Config) Validate() error {
 		// 0 is the explicit off switch for retirement; a negative window would make
 		// every hash stale and delete the fleet on the first tick.
 		return fmt.Errorf("STALE_AFTER must not be negative")
+	}
+	if c.StaleAfter > 0 {
+		// The span set is reused for HASH_SCAN_TTL, so a tick late in the cache
+		// judges a point that was fresh at scan time as the cache age old (plus
+		// up to one INTERVAL that the scan itself lagged). A window that does not
+		// cover both retires metrics that are still reporting, and their rows are
+		// re-created at the default cron instead of keeping the operator's edit.
+		scanTTL := c.HashScanTTL
+		if scanTTL <= 0 {
+			scanTTL = defaultHashScanTTL
+		}
+		if min := scanTTL + c.Interval; c.StaleAfter < min {
+			return fmt.Errorf("STALE_AFTER (%s) must be at least HASH_SCAN_TTL + INTERVAL (%s) while enabled", c.StaleAfter, min)
+		}
 	}
 	if c.LogLevel != "" && c.LogLevel != "info" && c.LogLevel != "debug" {
 		return fmt.Errorf("LOG_LEVEL must be info or debug")

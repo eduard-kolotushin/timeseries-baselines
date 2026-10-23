@@ -1017,3 +1017,22 @@ FROM forecast.retrain WHERE scope = 'baseline' AND org_id = 0 AND key = $1
 		t.Fatal("the returning metric was not trained into a snapshot")
 	}
 }
+
+// TestDecodeSnapshotBoundsTheDecompressedBody pins the store's size limit: a
+// gzip row can expand about a thousandfold, and one corrupt or foreign row must
+// fail that read instead of allocating without bound on every tick.
+func TestDecodeSnapshotBoundsTheDecompressedBody(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(make([]byte, maxSnapshotJSON+1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := decodeSnapshot("oversized", buf.Bytes())
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err = %v, want the decompressed-size refusal", err)
+	}
+}

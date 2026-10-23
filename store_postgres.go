@@ -149,20 +149,39 @@ func (s *postgresStore) Get(ctx context.Context, key string) (forecast.Snapshot,
 	if err != nil {
 		return forecast.Snapshot{}, false, err
 	}
+	snap, err := decodeSnapshot(key, raw)
+	if err != nil {
+		return forecast.Snapshot{}, false, err
+	}
+	return snap, true, nil
+}
+
+// maxSnapshotJSON bounds the decompressed snapshot body. A minute-of-week
+// baseline model is about 30k floats (roughly 1.2 MiB of JSON); 16 MiB leaves
+// room for a larger seasonality without letting a corrupt or foreign gzip row
+// expand without bound. This is the store's counterpart of the Druid reply cap.
+const maxSnapshotJSON = 16 << 20
+
+// decodeSnapshot gunzips and parses one stored model, refusing a body that
+// would expand past maxSnapshotJSON before it is unmarshalled.
+func decodeSnapshot(key string, raw []byte) (forecast.Snapshot, error) {
 	zr, err := gzip.NewReader(bytes.NewReader(raw))
 	if err != nil {
-		return forecast.Snapshot{}, false, fmt.Errorf("snapshot %s: %w", key, err)
+		return forecast.Snapshot{}, fmt.Errorf("snapshot %s: %w", key, err)
 	}
 	defer zr.Close()
-	plain, err := io.ReadAll(zr)
+	plain, err := io.ReadAll(io.LimitReader(zr, maxSnapshotJSON+1))
 	if err != nil {
-		return forecast.Snapshot{}, false, fmt.Errorf("snapshot %s: %w", key, err)
+		return forecast.Snapshot{}, fmt.Errorf("snapshot %s: %w", key, err)
+	}
+	if len(plain) > maxSnapshotJSON {
+		return forecast.Snapshot{}, fmt.Errorf("snapshot %s: decompressed body exceeds %d bytes", key, maxSnapshotJSON)
 	}
 	var snap forecast.Snapshot
 	if err := json.Unmarshal(plain, &snap); err != nil {
-		return forecast.Snapshot{}, false, fmt.Errorf("snapshot %s: %w", key, err)
+		return forecast.Snapshot{}, fmt.Errorf("snapshot %s: %w", key, err)
 	}
-	return snap, true, nil
+	return snap, nil
 }
 
 // Fresh reports updated_at for the keys that have a snapshot, in one query: the
