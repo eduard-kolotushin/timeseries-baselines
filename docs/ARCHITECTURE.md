@@ -211,7 +211,7 @@ ON CONFLICT (scope, org_id, key) DO NOTHING
 ```sql
 WITH due AS (
   SELECT scope, org_id, key FROM forecast.retrain
-  WHERE scope = 'baseline' AND enabled AND next_run_at IS NOT NULL AND next_run_at <= now()
+  WHERE scope = 'baseline' AND org_id = 0 AND enabled AND next_run_at IS NOT NULL AND next_run_at <= now()
     AND superseded_at IS NULL
     AND (claimed_until IS NULL OR claimed_until < now())
   ORDER BY next_run_at LIMIT $2 FOR UPDATE SKIP LOCKED
@@ -227,7 +227,7 @@ The lease is **renewed before the work it protects**. A tick's claims share one 
 
 ```sql
 UPDATE forecast.retrain
-SET claimed_until = now() + $5::interval
+SET claimed_until = now() + $4::interval
 WHERE scope = 'baseline' AND org_id = $3 AND key = $1 AND claimed_by = $2
 ```
 
@@ -305,7 +305,8 @@ type snapshotStore interface {
 type retrainQueue interface {
 	Schedule(ctx context.Context, keys []string, cron, tz string) error
 	Claim(ctx context.Context, owner string, lease time.Duration, limit int) ([]retrainClaim, error)
-	Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string) error
+	Extend(ctx context.Context, owner string, orgID int64, key string, lease time.Duration) (bool, error)
+	Done(ctx context.Context, owner string, orgID int64, key string, next time.Time, status string, attempts int) error
 }
 
 type membership interface {
@@ -341,11 +342,13 @@ Same as `timeseries-forecast`: last timestamp + `k * step` for `k = 1..h`. This 
 | `TRAIN_CONCURRENCY` | `2` | Whole retrains one worker runs at once |
 | `SNAPSHOT_CACHE_TTL` | `60s` | How often owned snapshots are re-probed for freshness |
 | `SNAPSHOT_TTL` | `72h` | Window after which the tick sweeps a `baselines.snapshots` row nothing refreshed and whose `forecast.retrain` row is idle too; `0` disables, `>=1h`, and longer than `DEFAULT_RETRAIN_CRON`'s next gap (both checked at startup) |
-| `STALE_AFTER` | `24h` | Freshness window (`now - span.Max` from the scan) for a hash to be alive — trained, scheduled and published. A tick with a fresh successful scan and a non-empty reply retires the `forecast.retrain` row and `baselines.snapshots` model of every baseline key that is absent or not alive. `0` disables retirement; a negative value is rejected |
+| `STALE_AFTER` | `24h` | Freshness window (`now - span.Max` from the scan) for a hash to be alive — trained, scheduled and published. A tick with a fresh successful scan and a non-empty reply retires the `forecast.retrain` row and `baselines.snapshots` model of every baseline key that is absent or not alive. `0` disables retirement; a negative value is rejected, and a positive one must be at least `HASH_SCAN_TTL + INTERVAL` because the scan set is reused for the whole cache window |
 | `WORKER_TTL` | `max(30s, 2*INTERVAL)` | A `baselines.workers` row is a peer while `last_seen` is newer than this; must stay longer than `INTERVAL` |
 | `SHARD_MEMBERSHIP` | `auto` | `auto` / `peers` / `dns` / `store` |
 | `DEFAULT_RETRAIN_CRON` | `0 3 * * *` | Cron for a newly scheduled `forecast.retrain` row |
-| `RETRAIN_RETRY` | `5m` | Lease length and the retry delay after a failed retrain |
+| `RETRAIN_RETRY` | `5m` | Base delay before a failed retrain is due again; also the floor of the derived lease |
+| `RETRAIN_LEASE` | derived | Claim lease, renewed immediately before each fit: `max(RETRAIN_RETRY, ceil(LOOKBACK / DRUID_MAX_RANGE) × DRUID_TIMEOUT + 1m)`; `0` derives it |
+| `RETRAIN_RETRY_MAX` | `1h` | Cap of the exponential retry delay; must be longer than `RETRAIN_RETRY` |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
 | `BASELINE_STORE_URL`, `BASELINE_STORE_HOST`, `BASELINE_STORE_PORT`, `BASELINE_STORE_DATABASE`, `BASELINE_STORE_USER`, `BASELINE_STORE_PASSWORD`, `BASELINE_STORE_SSLMODE` | empty | Snapshot/schedule/membership Postgres; falls back per field to `FORECAST_STORE_*`. No host and no URL: persist off |
 | `KAFKA_BROKERS` | (required) | Comma-separated brokers |
