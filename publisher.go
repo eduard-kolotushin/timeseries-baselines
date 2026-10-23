@@ -62,6 +62,7 @@ type Publisher struct {
 
 type snapshotFit struct {
 	updatedAt time.Time
+	last      time.Time
 	fitted    forecast.Fitted
 }
 
@@ -611,6 +612,16 @@ func (p *Publisher) emitSnapshot(ctx context.Context, key string, ts time.Time) 
 	if err != nil {
 		return false
 	}
+	// The signed grid also emits the snapshot's last point (k = 0), which is
+	// inside [ts-1m, ts] whenever the snapshot is behind the horizon. Publishing
+	// it would move the lead backwards; only a point newer than the snapshot's
+	// last is a forecast. A grid offset from the minute still publishes its newest
+	// point after the last one, which is the at-or-before-horizon fallback.
+	if !pt.Time.After(cached.last) {
+		p.warnOnce(key, "behind horizon", "snapshot has no grid point after its last",
+			"metric_hash", key, "ts", ts, "last", cached.last)
+		return false
+	}
 	if math.IsNaN(pt.Value) {
 		return false
 	}
@@ -722,7 +733,8 @@ func (p *Publisher) refreshSnapshots(ctx context.Context, keys []string, now tim
 			slog.Error("snapshot restore", "metric_hash", key, "err", err)
 			continue
 		}
-		p.fitted[key] = snapshotFit{updatedAt: updated, fitted: fitted}
+		last := time.UnixMilli(snap.Last).UTC()
+		p.fitted[key] = snapshotFit{updatedAt: updated, last: last, fitted: fitted}
 		delete(p.warned, key)
 	}
 }

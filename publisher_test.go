@@ -1896,3 +1896,77 @@ func TestPublisherBacksOffFurtherOnEachFailure(t *testing.T) {
 		})
 	}
 }
+
+// TestEmitSnapshotPublishesOnlyForecastPoints: a publish is a point newer than
+// the snapshot's last data point. With the signed forecast grid a window that
+// misses the horizon still contains that in-sample point, so publishing the
+// range's last point would move the lead backwards. A real forecast point
+// (k >= 1) publishes even when the grid is offset from the minute and its newest
+// point is before the horizon.
+func TestEmitSnapshotPublishesOnlyForecastPoints(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	fit := func(times ...time.Time) forecast.Fitted {
+		t.Helper()
+		f, err := forecast.FitNaive(timeseries.MustNew(times, []float64{1, 2, 3}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	publisher := func(f forecast.Fitted, last time.Time) (*Publisher, *fakeSink) {
+		sink := &fakeSink{}
+		return &Publisher{
+			sink:      sink,
+			published: map[string]int64{},
+			warned:    map[string]string{},
+			fitted:    map[string]snapshotFit{"h": {last: last, fitted: f}},
+		}, sink
+	}
+
+	// Last point 12:00:30, horizon 12:01: the window holds only that in-sample
+	// point, which is before the horizon.
+	off, offSink := publisher(fit(
+		base.Add(-2*time.Minute+30*time.Second),
+		base.Add(-time.Minute+30*time.Second),
+		base.Add(30*time.Second),
+	), base.Add(30*time.Second))
+	if off.emitSnapshot(ctx, "h", base.Add(time.Minute)) {
+		t.Fatal("published a point before the horizon")
+	}
+	if len(offSink.msgs) != 0 {
+		t.Fatalf("published %d messages before the horizon", len(offSink.msgs))
+	}
+	if off.warned["h"] == "" {
+		t.Fatal("no warning for the off-horizon grid")
+	}
+
+	// Last point 12:00, horizon 12:01: the grid has a point exactly at it.
+	on, onSink := publisher(fit(
+		base.Add(-2*time.Minute),
+		base.Add(-time.Minute),
+		base,
+	), base)
+	if !on.emitSnapshot(ctx, "h", base.Add(time.Minute)) {
+		t.Fatal("did not publish the aligned horizon")
+	}
+	if len(onSink.msgs) != 1 || onSink.msgs[0].MetricTS != base.Add(time.Minute).UnixMilli() {
+		t.Fatalf("published %+v, want one point at the horizon", onSink.msgs)
+	}
+
+	// A grid offset far enough behind the horizon has a k >= 1 point inside the
+	// window even though it is not exactly at the horizon; that point must still
+	// publish (the fallback the misaligned-grid path relies on).
+	offset, offsetSink := publisher(fit(
+		base.Add(-2*time.Minute-23*time.Second),
+		base.Add(-time.Minute-23*time.Second),
+		base.Add(-23*time.Second),
+	), base.Add(-23*time.Second))
+	if !offset.emitSnapshot(ctx, "h", base.Add(time.Minute)) {
+		t.Fatal("did not publish the offset grid's newest forecast point")
+	}
+	if len(offsetSink.msgs) != 1 || offsetSink.msgs[0].MetricTS != base.Add(37*time.Second).UnixMilli() {
+		t.Fatalf("published %+v, want one point at 12:00:37", offsetSink.msgs)
+	}
+}
